@@ -17,8 +17,10 @@ SELL_EARLY_TH = 0.10
 SECTOR_MAX_TH = 0.50
 RF_ANNUAL = 0.043   # 無風險利率(年)：美國短期國庫券約 4.3%，Jensen's Alpha 用（tunable）
 
-# ── ticker → (sector, ai_capex?)  AI capex = 同一個底層 driver（VY B2 的「driver」代理）──
-DRIVER = {
+# ── ticker → (sector, thematic?)  thematic=1 代表同屬一個跨產業主題(如 AI capex)= VY B2 的「driver」──
+# 這張表只是「常見股 fallback」。主路徑:SKILL 指引 Claude 對『實際持倉』用世界知識生成 driver map
+# (含冷門股 + 跨 sector 主題),寫成 JSON 餵進來覆寫 → 冷門股不再變「未分類」、分散維不失準。
+DRIVER_FALLBACK = {
     # 半導體
     "NVDA":("半導體",1),"AMD":("半導體",1),"MU":("半導體",1),"AVGO":("半導體",1),"ARM":("半導體",1),
     "TSM":("半導體",1),"MRVL":("半導體",1),"ALAB":("半導體",1),"CRDO":("半導體",1),"ASML":("半導體",1),
@@ -40,7 +42,19 @@ DRIVER = {
     "SPY":("大盤ETF",0),"VT":("大盤ETF",0),"VOO":("大盤ETF",0),"EWY":("區域ETF",0),
     "IAU":("商品",0),"IEF":("債券",0),
 }
-def driver(t): return DRIVER.get(t, ("其他", 0))
+_DRIVER_MAP = dict(DRIVER_FALLBACK)
+def driver(t): return _DRIVER_MAP.get(t, ("未分類", 0))
+def load_driver_map(path):
+    """載入 Claude 生成的 {ticker: [sector, thematic]} JSON 覆寫 fallback。讓冷門股也有正確 driver。"""
+    import json
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = json.load(f)
+        for t, v in m.items():
+            _DRIVER_MAP[t] = (v[0], int(v[1]))
+        return len(m)
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return 0
 
 # ─────────────────────────── 1. 解析 ───────────────────────────
 def load(paths):
@@ -124,7 +138,12 @@ def fetch_prices(tickers, start):
         data = data.to_frame()
     return data, None
 
-def fwd_from_px(rts, data):
+def adaptive_n_fwd(rows):
+    """賣出後觀察窗隨資料長度自適應:資料短就用短窗,讓半年資料的近端賣出也算得到 winner_early。"""
+    span = (rows[-1]["date"] - rows[0]["date"]).days
+    return 30 if span >= 365 else 20 if span >= 120 else 10   # ≥1年→30d,半年→20d,更短→10d
+
+def fwd_from_px(rts, data, n_fwd=N_FWD):
     import pandas as pd
     if data is None:
         return None, None
@@ -137,9 +156,9 @@ def fwd_from_px(rts, data):
         last_px[t] = float(col.iloc[-1])
         after = col[col.index > pd.Timestamp(r["exit"])]
         if len(after) == 0: continue
-        target = after.iloc[min(N_FWD-1, len(after)-1)]
+        target = after.iloc[min(n_fwd-1, len(after)-1)]
         r["fwd"] = (float(target) - r["sell_px"]) / r["sell_px"]
-        r["fwd_trunc"] = len(after) < N_FWD
+        r["fwd_trunc"] = len(after) < n_fwd
         fwds.append(r["fwd"])
     return fwds, last_px
 
@@ -207,17 +226,22 @@ def print_alpha_beta(d):
     print(f"    ▸ 下次只改：每季只認 alpha，別把『大盤＋槓桿』給你的，當成自己的能力。")
 
 # ─────────────────────────── 5. 五維 metrics ───────────────────────────
+MIN_WINNERS = 5     # winner_early 至少要這麼多「賣掉的贏家」才算可信(半年資料通常達得到)
+
 def dim_exit(rts, fwds):
     # rts 已在 main 預先濾成「決策賣出」（排除大盤/債/商品 ETF 再平衡）
     early_rate = avg_forgone = winner_early = None
+    n_winners = 0
     scored = [r for r in rts if "fwd" in r]
     n_trunc = sum(1 for r in scored if r.get("fwd_trunc"))
     if scored:
         early_rate = sum(1 for r in scored if r["fwd"] > SELL_EARLY_TH) / len(scored)
         avg_forgone = statistics.mean(r["fwd"] for r in scored)
         winners = [r for r in scored if r["ret"] > 0]                 # 賣掉賺錢的
+        n_winners = len(winners)
         if winners:
             winner_early = sum(1 for r in winners if r["fwd"] > SELL_EARLY_TH) / len(winners)
+    low_conf = n_winners < MIN_WINNERS    # 樣本太少 → 仍給數字但標「低信賴」,不直接降權消失
     win_holds = [r["hold"] for r in rts if r["ret"] > 0]
     lose_holds = [r["hold"] for r in rts if r["ret"] < 0]
     hw = statistics.median(win_holds) if win_holds else 0
@@ -225,12 +249,14 @@ def dim_exit(rts, fwds):
     disp = hl - hw
     win_rate = sum(1 for r in rts if r["ret"] > 0) / len(rts) if rts else 0
     sev = max((early_rate or 0), (winner_early or 0), (avg_forgone or 0)/0.2, disp/60)
+    if low_conf: sev *= 0.7              # 低樣本只打折,不歸零——半年資料也看得到方向
     trig = (early_rate is not None and early_rate > 0.5) or (winner_early is not None and winner_early > 0.5) \
            or (avg_forgone is not None and avg_forgone > 0.08) or disp > 20
     return dict(dim="出場紀律", tier=1, triggered=trig, severity=min(max(sev,0),1),
                 early_rate=early_rate, avg_forgone=avg_forgone, winner_early=winner_early,
                 disp_gap=disp, hold_win=hw, hold_lose=hl, sell_win_rate=win_rate,
-                n_rt=len(rts), n_scored=len(scored), n_trunc=n_trunc)
+                n_rt=len(rts), n_scored=len(scored), n_trunc=n_trunc,
+                n_winners=n_winners, low_conf=low_conf)
 
 def dim_size(rows, held, last_px):
     # 用市值（有 yf）或成本算當前權重；entry size_pct 用累計淨投入代理
@@ -308,7 +334,19 @@ def dim_avgdown(avg_down, held, last_px, size_dim):
                 severity=sev, count=cnt, breach=breach, tickers=tickers)
 
 # ─────────────────────────── 6. 卡片選擇 + 渲染 ───────────────────────────
-CARD_LIB = {
+# ── 鏡片層(可換大師):洞的「規矩 + 引言」來自 lens 檔,engine 不 hardcode VY ──
+_LENS = None
+DEFAULT_LENS = os.path.join(os.path.dirname(__file__), "..", "rubric", "vincent-yu.lens.json")
+def load_lens(path=DEFAULT_LENS):
+    """載入鏡片檔(規矩/引言/找動機問句)。換大師 = 換這個檔,engine 不動。"""
+    global _LENS
+    import json
+    try:
+        with open(path, encoding="utf-8") as f: _LENS = json.load(f)
+        return _LENS.get("master")
+    except (OSError, ValueError): return None
+
+CARD_LIB_FALLBACK = {
  "出場紀律": ("賣出前先寫一句『我賣的理由是 thesis 破了，還是手癢/想換現金?』",
               "在清醒時先把出場規則寫好，把判斷從『當下』移到『事前』。(VY)"),
  "部位 sizing": ("下單前先決定『這筆最多佔幾 %、為什麼是這個數而不是兩倍』。",
@@ -320,6 +358,31 @@ CARD_LIB = {
  "加碼攤平": ("往下加碼前必須寫出『一個進場時不知道的新證據』；寫不出 → 不加。",
               "不要出現『再加碼就能回本』就破線。(VY)"),
 }
+def card_for(dim):
+    """(rule, quote):優先用 lens 檔(可換大師),載入失敗用 fallback。"""
+    if _LENS and dim in _LENS.get("dims", {}):
+        d = _LENS["dims"][dim]; m = _LENS.get("master", "VY")
+        return d.get("rule", ""), f"{d.get('quote', '')}（{m}）"
+    return CARD_LIB_FALLBACK.get(dim, ("", ""))
+
+def dim_strength(exit_dim, size_dim, avgdown_dim, div_dim, hold_dim):
+    """負回饋循環解藥:卡片先給『你做對的最強一件事』再給洞。
+    (demand-side 研究:看虧損=ego受傷;先肯定 → 降低防衛 → 才聽得進那一刀。)"""
+    c = []
+    we = exit_dim.get("winner_early")
+    if we is not None and we < 0.35 and not exit_dim.get("low_conf"):
+        c.append((0.7 + (0.35 - we), f"你抱得住會跑的單——賣掉的贏家只 {we*100:.0f}% 事後續漲,出場不手軟。"))
+    mp = size_dim.get("max_pct", 1)
+    if mp < 0.22:
+        c.append((1 - mp, f"你 sizing 有紀律——最大一筆只佔 {mp*100:.0f}%,沒梭哈。"))
+    if avgdown_dim.get("breach", 1) == 0 and avgdown_dim.get("count", 0) >= 2:
+        c.append((0.65, f"你往下加碼 {avgdown_dim['count']} 次,卻沒讓任何一筆破部位上限——紅線守住了。"))
+    if not div_dim.get("triggered") and div_dim.get("n", 0) >= 5:
+        c.append((0.6, f"你 {div_dim['n']} 檔的 driver 夠分散,沒全押單一主題。"))
+    if not hold_dim.get("triggered") and hold_dim.get("median_hold"):
+        c.append((0.5, f"你有一致的時間框架——中位持有 {hold_dim['median_hold']:.0f} 天,進出沒亂套。"))
+    if not c: return None
+    c.sort(reverse=True); return c[0][1]
 def number_line(d):
     n = d["dim"]
     if n == "出場紀律":
@@ -342,12 +405,13 @@ def number_line(d):
         return f"你有 {d['count']} 次在虧損倉往下加碼（{', '.join(d['tickers'][:6])}），其中 {d['breach']} 次加到 >25%"
     return ""
 
-def render(dims):
+def render(dims, strength=None):
     TW = {1: 1.0, 2: 0.7}
     trig = [d for d in dims if d["triggered"]]
     trig.sort(key=lambda d: d["severity"] * TW[d["tier"]], reverse=True)
+    master = (_LENS or {}).get("master", "Vincent Yu")
     print("="*60)
-    print("  trade-recap · 鏡片 Vincent Yu  (引擎產出，非人肉)")
+    print(f"  trade-recap · 鏡片 {master}  (引擎產出)")
     print("="*60)
     print("\n[5 維 severity（× tier 權重後排序）+ 原始數字]")
     for d in sorted(dims, key=lambda d: d["severity"]*TW[d["tier"]], reverse=True):
@@ -355,12 +419,16 @@ def render(dims):
         print(f"  {flag} {d['dim']:<8} sev={d['severity']:.2f} ×tier{d['tier']} = {d['severity']*TW[d['tier']]:.2f}")
         print(f"      {number_line(d)}")
     print("\n" + "─"*60)
+    if strength:                                   # 先肯定做對的一件事(降 ego 防衛),再給洞
+        intro = (_LENS or {}).get("strength_intro", "先說你做對的一件事:")
+        print(f"  ✅ {intro}")
+        print(f"     {strength}\n")
     if not trig:
-        print("  這 5 個地基你目前都守住了。進階維度需要你補一句下單理由。")
+        print("  這幾個地基你目前都守住了。進階維度需要你補一句下單理由。")
         return
     print("  復盤卡（top 1-2 最高代價的洞）：\n")
     for d in trig[:2]:
-        rule, quote = CARD_LIB[d["dim"]]
+        rule, quote = card_for(d["dim"])
         print(f"  ▍最大漏洞 · {d['dim']}")
         print(f"    {number_line(d)}")
         print(f"    ▸ 下次只改這一件：{rule}")
@@ -370,23 +438,29 @@ def render(dims):
 def main():
     paths = sys.argv[1:] or [DEFAULT_CSV]
     rows = load(paths)
+    master = load_lens()                                  # 鏡片(預設 VY,可換大師檔)
+    dm = os.environ.get("TR_DRIVER_MAP")                  # Claude 生成的 driver map(冷門股分類)
+    n_dm = load_driver_map(dm) if dm else 0
     rts, open_lots = round_trips(rows)
     held, avg_down = positions(rows)
     tickers = {r["ticker"] for r in rts} | set(held.keys())
     start = (min((r["entry"] for r in rts), default=rows[0]["date"]) - dt.timedelta(days=10)).isoformat()
     px, yf_err = fetch_prices(tickers, start)
-    fwds, last_px = fwd_from_px(rts, px)
+    fwds, last_px = fwd_from_px(rts, px, adaptive_n_fwd(rows))   # 觀察窗隨資料長度自適應
     print(f"# 載入 {len(rows)} 筆交易（{rows[0]['date']} ~ {rows[-1]['date']}），"
           f"{len(rts)} 個 round-trip，當前持倉 {len(held)} 檔。", end="")
-    print(f" yfinance: {'OK' if not yf_err else yf_err}")
+    print(f" yfinance: {'OK' if not yf_err else yf_err}｜鏡片: {master or 'fallback'}"
+          f"｜driver map: {n_dm} 檔" + (" (純 fallback,冷門股可能失準)" if not n_dm else ""))
     BROAD = {"大盤ETF", "商品", "債券", "區域ETF"}   # 再平衡/現金管理，非選股決策
     decision_rts = [r for r in rts if driver(r["ticker"])[0] not in BROAD]
     print(f"# 出場紀律只看「決策賣出」：{len(decision_rts)}/{len(rts)} round-trip"
           f"（排除 {len(rts)-len(decision_rts)} 筆大盤/債/商品 ETF 再平衡）")
     d_size = dim_size(rows, held, last_px)
-    dims = [dim_exit(decision_rts, fwds), d_size, dim_diversify(held, last_px),
-            dim_hold(rts), dim_avgdown(avg_down, held, last_px, d_size)]
-    render(dims)
+    d_exit = dim_exit(decision_rts, fwds); d_div = dim_diversify(held, last_px)
+    d_hold = dim_hold(rts); d_avgdown = dim_avgdown(avg_down, held, last_px, d_size)
+    dims = [d_exit, d_size, d_div, d_hold, d_avgdown]
+    strength = dim_strength(d_exit, d_size, d_avgdown, d_div, d_hold)   # 先給做對的一件事
+    render(dims, strength)
     print_alpha_beta(dim_alpha_beta(rows, px))
 
 if __name__ == "__main__":
