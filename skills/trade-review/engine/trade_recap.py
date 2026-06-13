@@ -396,8 +396,8 @@ def best_worst(rts):
     if not closed: return None, None
     return max(closed, key=lambda r: r["ret"]), min(closed, key=lambda r: r["ret"])
 
-def overview_stats(rts, ab):
-    """卡片最上方的量化總覽:看『金額』不是『筆數勝率』(勝率高 ≠ 賺錢,大賺小賠才是)。"""
+def overview_stats(rts, ab, held=None, last_px=None):
+    """金額導向總覽:已實現(賣掉落袋)+ 未實現(還抱著)都要算,只報一個會失真。"""
     pnls = [r["qty"] * (r["sell_px"] - r["buy_px"]) for r in rts
             if r.get("sell_px") and r.get("buy_px")]
     wins = [p for p in pnls if p > 0]; losses = [p for p in pnls if p < 0]
@@ -406,7 +406,11 @@ def overview_stats(rts, ab):
     avg_loss = loss_sum / len(losses) if losses else 0
     payoff = avg_win / abs(avg_loss) if avg_loss else 0          # 平均賺 / 平均賠
     pf = win_sum / abs(loss_sum) if loss_sum else 0              # 賺總額 / 賠總額(獲利因子)
-    return dict(n_rt=len(rts), total=win_sum + loss_sum, win_sum=win_sum, loss_sum=loss_sum,
+    realized = win_sum + loss_sum
+    unrealized = sum(sh * last_px[t] - c for t, (sh, c) in (held or {}).items()
+                     if last_px and t in last_px)                 # 還抱著的帳面盈虧
+    return dict(n_rt=len(rts), realized=realized, unrealized=unrealized,
+                total_pnl=realized + unrealized, win_sum=win_sum, loss_sum=loss_sum,
                 n_wins=len(wins), n_losses=len(losses), avg_win=avg_win, avg_loss=avg_loss,
                 payoff=payoff, pf=pf, ab=ab)
 
@@ -447,17 +451,17 @@ def render(dims, strength=None, overview=None, best=None, worst=None, wi=None):
     print("="*60)
     print(f"  trade-recap · 鏡片 {master}  (引擎產出)")
     print("="*60)
-    if overview:                                   # 〔總覽〕看金額,不看筆數勝率
+    if overview:                                   # 〔總覽〕已實現 + 未實現都報,看金額不看筆數
         o = overview; ab = o.get("ab") or {}
-        print(f"\n〔總覽〕已實現損益 {o['total']:+,.0f}｜賺的單共 +{o['win_sum']:,.0f} / 賠的單共 {o['loss_sum']:,.0f}")
-        print(f"       盈虧比 {o['payoff']:.1f}（平均賺 ${o['avg_win']:,.0f} vs 平均賠 ${abs(o['avg_loss']):,.0f}）"
-              f"｜獲利因子 {o['pf']:.2f}（賺的總額是賠的 {o['pf']:.1f} 倍）")
+        print(f"\n〔總覽 · 金額〕帳面總損益 {o['total_pnl']:+,.0f}")
+        print(f"  = 已實現(賣掉落袋){o['realized']:+,.0f}  +  未實現(還抱著){o['unrealized']:+,.0f}")
+        print(f"  你『主動買賣』的盈虧比 {o['payoff']:.1f}（平均賺 ${o['avg_win']:,.0f} vs 平均賠 ${abs(o['avg_loss']):,.0f}）")
         if ab and not ab.get("note"):
-            warn = "" if ab["n"] >= 252 else f"  ⚠️ 只 {ab['n']} 交易日,要 ≥1 年(~252天)才準"
-            print(f"       贏大盤 {ab['excess_vs_spy']*100:+.0f}pp｜β {ab['beta']:.2f}（漲跌是大盤 {ab['beta']:.1f} 倍）"
+            warn = "" if ab["n"] >= 252 else f"  ⚠️ 只 {ab['n']} 天,要 ≥1 年才準"
+            print(f"  贏大盤 {ab['excess_vs_spy']*100:+.0f}pp｜β {ab['beta']:.2f}（漲跌是大盤 {ab['beta']:.1f} 倍）"
                   f"｜真本事 α 年化 {ab['alpha_ann']*100:+.0f}%{warn}")
         elif ab and ab.get("note"):
-            print(f"       α/β:{ab['note']}")
+            print(f"  α/β:{ab['note']}")
     if best and worst:                             # 做得最好 / 最差的一筆具體交易
         print(f"\n〔做得最好 / 最差的一筆〕")
         print(f"  ✅ 最賺:{best['ticker']} {best['ret']*100:+.0f}%（{best['buy_px']:.0f}→{best['sell_px']:.0f},抱 {best['hold']} 天）")
@@ -513,7 +517,7 @@ def main():
     dims = [d_exit, d_size, d_div, d_hold, d_avgdown]
     strength = dim_strength(d_exit, d_size, d_avgdown, d_div, d_hold, decision_rts)  # 先給做對的(附案例)
     ab = dim_alpha_beta(rows, px)
-    overview = overview_stats(decision_rts, ab)            # 最上方量化總覽(金額導向)
+    overview = overview_stats(decision_rts, ab, held, last_px)   # 已實現 + 未實現都報
     best, worst = best_worst(decision_rts)                 # 做得最好/最差的一筆
     wi = what_if(held, last_px)                            # 可量化的 what-if
     render(dims, strength, overview, best, worst, wi)
