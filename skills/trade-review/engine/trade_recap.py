@@ -397,11 +397,26 @@ def best_worst(rts):
     return max(closed, key=lambda r: r["ret"]), min(closed, key=lambda r: r["ret"])
 
 def overview_stats(rts, ab):
-    """卡片最上方的量化總覽:配對數 / 勝負 / 勝率 / α / β。"""
-    n = len(rts)
-    wins = sum(1 for r in rts if r["ret"] > 0)
-    losses = sum(1 for r in rts if r["ret"] < 0)
-    return dict(n_rt=n, wins=wins, losses=losses, win_rate=(wins/n if n else 0), ab=ab)
+    """卡片最上方的量化總覽:看『金額』不是『筆數勝率』(勝率高 ≠ 賺錢,大賺小賠才是)。"""
+    pnls = [r["qty"] * (r["sell_px"] - r["buy_px"]) for r in rts
+            if r.get("sell_px") and r.get("buy_px")]
+    wins = [p for p in pnls if p > 0]; losses = [p for p in pnls if p < 0]
+    win_sum, loss_sum = sum(wins), sum(losses)      # loss_sum 為負
+    avg_win = win_sum / len(wins) if wins else 0
+    avg_loss = loss_sum / len(losses) if losses else 0
+    payoff = avg_win / abs(avg_loss) if avg_loss else 0          # 平均賺 / 平均賠
+    pf = win_sum / abs(loss_sum) if loss_sum else 0              # 賺總額 / 賠總額(獲利因子)
+    return dict(n_rt=len(rts), total=win_sum + loss_sum, win_sum=win_sum, loss_sum=loss_sum,
+                n_wins=len(wins), n_losses=len(losses), avg_win=avg_win, avg_loss=avg_loss,
+                payoff=payoff, pf=pf, ab=ab)
+
+def what_if(held, last_px):
+    """把『會一起倒』的空話換成可量化的 what-if:AI 暴險市值 × 回檔情境。"""
+    if not last_px: return None
+    ai = sum(sh * last_px[t] for t, (sh, c) in held.items() if driver(t)[1] == 1 and t in last_px)
+    tot = sum(sh * last_px[t] for t, (sh, c) in held.items() if t in last_px)
+    if tot <= 0: return None
+    return dict(ai_mval=ai, ai_pct=ai / tot, drop30=ai * 0.30, drop50=ai * 0.50)
 def number_line(d):
     n = d["dim"]
     if n == "出場紀律":
@@ -424,7 +439,7 @@ def number_line(d):
         return f"你有 {d['count']} 次在虧損倉往下加碼（{', '.join(d['tickers'][:6])}），其中 {d['breach']} 次加到 >25%"
     return ""
 
-def render(dims, strength=None, overview=None, best=None, worst=None):
+def render(dims, strength=None, overview=None, best=None, worst=None, wi=None):
     TW = {1: 1.0, 2: 0.7}
     trig = [d for d in dims if d["triggered"]]
     trig.sort(key=lambda d: d["severity"] * TW[d["tier"]], reverse=True)
@@ -432,17 +447,24 @@ def render(dims, strength=None, overview=None, best=None, worst=None):
     print("="*60)
     print(f"  trade-recap · 鏡片 {master}  (引擎產出)")
     print("="*60)
-    if overview:                                   # 〔總覽〕量化:勝負 / 勝率 / α / β
+    if overview:                                   # 〔總覽〕看金額,不看筆數勝率
         o = overview; ab = o.get("ab") or {}
-        print(f"\n〔總覽〕{o['n_rt']} 筆完整買賣配對｜勝 {o['wins']} / 負 {o['losses']}（勝率 {o['win_rate']*100:.0f}%）")
+        print(f"\n〔總覽〕已實現損益 {o['total']:+,.0f}｜賺的單共 +{o['win_sum']:,.0f} / 賠的單共 {o['loss_sum']:,.0f}")
+        print(f"       盈虧比 {o['payoff']:.1f}（平均賺 ${o['avg_win']:,.0f} vs 平均賠 ${abs(o['avg_loss']):,.0f}）"
+              f"｜獲利因子 {o['pf']:.2f}（賺的總額是賠的 {o['pf']:.1f} 倍）")
         if ab and not ab.get("note"):
-            warn = "" if ab["n"] >= 252 else f"  ⚠️ 僅 {ab['n']} 交易日(<1年),α 不可信、僅參考"
+            warn = "" if ab["n"] >= 252 else f"  ⚠️ 只 {ab['n']} 交易日,要 ≥1 年(~252天)才準"
             print(f"       贏大盤 {ab['excess_vs_spy']*100:+.0f}pp｜β {ab['beta']:.2f}（漲跌是大盤 {ab['beta']:.1f} 倍）"
                   f"｜真本事 α 年化 {ab['alpha_ann']*100:+.0f}%{warn}")
+        elif ab and ab.get("note"):
+            print(f"       α/β:{ab['note']}")
     if best and worst:                             # 做得最好 / 最差的一筆具體交易
         print(f"\n〔做得最好 / 最差的一筆〕")
         print(f"  ✅ 最賺:{best['ticker']} {best['ret']*100:+.0f}%（{best['buy_px']:.0f}→{best['sell_px']:.0f},抱 {best['hold']} 天）")
         print(f"  ❌ 最虧:{worst['ticker']} {worst['ret']*100:+.0f}%（{worst['buy_px']:.0f}→{worst['sell_px']:.0f},抱 {worst['hold']} 天）")
+    if wi:                                          # what-if:可量化的情境,不講「會一起倒」空話
+        print(f"\n〔what if〕你 AI 暴險市值約 ${wi['ai_mval']:,.0f}（佔 {wi['ai_pct']*100:.0f}%）")
+        print(f"  AI 回檔 30%(一般修正)→ 帳面 -${wi['drop30']:,.0f}；回檔 50%(2022級熊市)→ -${wi['drop50']:,.0f}。撐得住嗎?")
     print("\n[5 維 severity（× tier 權重後排序）+ 原始數字]")
     for d in sorted(dims, key=lambda d: d["severity"]*TW[d["tier"]], reverse=True):
         flag = "🔴" if d["triggered"] else "⚪"
@@ -491,9 +513,10 @@ def main():
     dims = [d_exit, d_size, d_div, d_hold, d_avgdown]
     strength = dim_strength(d_exit, d_size, d_avgdown, d_div, d_hold, decision_rts)  # 先給做對的(附案例)
     ab = dim_alpha_beta(rows, px)
-    overview = overview_stats(decision_rts, ab)            # 最上方量化總覽
+    overview = overview_stats(decision_rts, ab)            # 最上方量化總覽(金額導向)
     best, worst = best_worst(decision_rts)                 # 做得最好/最差的一筆
-    render(dims, strength, overview, best, worst)
+    wi = what_if(held, last_px)                            # 可量化的 what-if
+    render(dims, strength, overview, best, worst, wi)
     print_alpha_beta(ab)
 
 if __name__ == "__main__":
