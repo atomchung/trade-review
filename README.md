@@ -5,6 +5,24 @@
 
 不是又一份統計報表。它做的是報表做不到的事:**先算出你看不見的行為漏洞,再問出你不願承認的動機,最後逼你下次只改一件事。**
 
+## Quick start(30 秒看到輸出)
+
+```bash
+git clone https://github.com/atomchung/trade-review && cd trade-review
+pip install -r requirements.txt
+cd skills/trade-review && python3 engine/trade_recap.py   # 跑內建 mock,印出完整診斷
+```
+要對自己的交易跑、掛進 Claude Code → 見下方 [安裝](#安裝)。
+
+## 跑出來長什麼樣
+
+![trade-review 復盤卡 demo](docs/demo-card.png)
+
+跑內建 mock 的復盤卡:總覽(看金額,不看筆數勝率)→ 標的層診斷(按金額排序、主從分類 DCA vs 凹單)→ 一個洞 + 一條下次能驗的規矩 + 大師引言。圖的原始檔在 [`docs/demo-card.html`](docs/demo-card.html)。
+
+> 真實使用時,引擎還會挑出「金額大 + 虧損中狂加碼」的標的,在**出卡前**先問你「這是逢低還是凹單?」——機械分不出的動機,你一句話定案,卡才出定論。
+> ⚠️ mock 的 α 數字會失真(持倉太集中、橫截面太窄),demo 別當真;真實多元持倉才看 α。
+
 ---
 
 ## 它跟「貼對帳單給 ChatGPT」差在哪
