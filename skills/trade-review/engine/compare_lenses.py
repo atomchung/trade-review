@@ -26,7 +26,9 @@ import os
 
 LENS_DIR = os.path.join(os.path.dirname(__file__), "..", "rubric")
 
-STANCE_J = {"inverted": -1.0, "conditional": 0.5, "aligned": 0.7, "unconditional": 1.0}
+STANCE_J = {"inverted": -1.0, "conditional": 0.5, "aligned": 0.0, "unconditional": 1.0}
+# aligned = 0.0(中立基線):普世/meta 派(如交易心理)不該被當「最對立」,它沒在 fork。
+# 它對各派的距離由 lean 軸補(有 lean 才算方向分歧),所以仍保留「VY 在乎 sizing」這種訊號。
 LEAN_W = 0.6
 STANCE_ZH = {
     "aligned": "普世·兩派同看",
@@ -86,10 +88,15 @@ def compare_lenses(dims, lenses):
     return rows
 
 
+def _name(lens):
+    """去掉括號來源,取學派短名:『動能紀律(O'Neil…)』→『動能紀律』。"""
+    return lens["master"].split("(")[0].strip()
+
+
 def _short(lens, key):
     d = lens["dims"][key]
     lean = f"·{d['lean']}" if d.get("lean") else ""
-    return f"{lens['master']:<28} [{d.get('stance','aligned')}{lean}]"
+    return f"{_name(lens):<8} [{d.get('stance','aligned')}{lean}]"
 
 
 def render(rows):
@@ -101,7 +108,7 @@ def render(rows):
     print("[分歧排序]  洞          severity × 2D距離 = 分歧度   最對立的一對")
     for r in rows:
         mark = "🔱" if r is rows[0] else ("🔸" if r["div"] > 0 else "⚪")
-        pair = f"{r['a']['master'][:6]} ⟷ {r['b']['master'][:6]}" if r["dist"] > 0 else "(無岔路)"
+        pair = f"{_name(r['a'])} ⟷ {_name(r['b'])}" if r["dist"] > 0 else "(無岔路)"
         print(f"  {mark} {r['key']:<9} {r['sev']:.2f} × {r['dist']:.2f} = {r['div']:.2f}   {pair}")
 
     top = rows[0]
