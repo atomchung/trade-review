@@ -145,7 +145,7 @@ DEMO_DIMS = [
 ]
 
 LENS_NAMES = ["vincent-yu", "momentum-discipline", "concentration-conviction",
-              "margin-of-safety", "trading-psychology"]
+              "margin-of-safety", "trading-psychology", "grayscale-thinking"]
 
 if __name__ == "__main__":
     lenses = [load_lens(n) for n in LENS_NAMES]
