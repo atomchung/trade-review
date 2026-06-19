@@ -270,8 +270,10 @@ def alpha_credible(ab, dims):
     if ab.get("n", 0) < 252:                                   # (a) < ~1 年交易日 → 不顯著
         return False
     div = next((d for d in dims if d.get("dim") == "分散"), None)
-    if div and (max(div.get("ai_pct", 0), div.get("max_sector_pct", 0)) >= 0.50
-                or div.get("n", 0) < 8):                        # (b) 橫截面太窄 = 押賽道,非選股
+    if not div:                                                # 無橫截面證據 → 閉閘(fail-closed,codex review)
+        return False
+    if (max(div.get("ai_pct", 0), div.get("max_sector_pct", 0)) >= 0.50
+            or div.get("n", 0) < 8):                           # (b) 橫截面太窄 = 押賽道,非選股
         return False
     return True
 
@@ -289,6 +291,13 @@ def print_alpha_beta(d):
         print(f"    ① alpha(vs 通用大盤,調風險後):{spy['alpha_ann']*100:+.0f}%/年,β {spy['beta']:.2f}（波動是大盤 {spy['beta']:.1f} 倍）")
     else:
         print(f"    ① β {spy['beta']:.2f}（波動是大盤 {spy['beta']:.1f} 倍）;α 不單獨報數——樣本 <1 年或持倉過度集中時,α=賽道紅利+雜訊,非選股能力")
+    if not d.get("credible"):                                  # codex review:不 credible 時不輸出任何「選股能力」結論
+        sens = "、".join(f"vs {sk} {(port - bs[sk]['bench_tot'])*100:+.0f}pp"
+                         for sk in ("QQQ", "SOXX") if sk in bs)
+        extra = f"(贏大盤對基準極敏感:{sens},換基準結論就翻)" if sens else ""
+        print(f"    ② α / 選股能力:資料不足以判定{extra}——還分不出『選股』還是『押對賽道』,先看行為層。")
+        print(f"    (持倉法日報酬近似;基準=通用大盤 SPY。)")
+        return
     print(f"    ② 你贏大盤的 {vs_spy*100:+.0f}pp,有多少是『選股』、多少是『押對賽道』?——換對照看敏感度:")
     for sk, tag in [("QQQ", "科技,較中性"), ("SOXX", "半導體,事後最強板塊→偏嚴苛")]:
         if sk in bs:
@@ -653,7 +662,7 @@ def render(dims, strength=None, overview=None, best=None, worst=None, wi=None, t
             if ab.get("credible"):
                 print(base + f"｜真本事 α 年化 {ab['alpha_ann']*100:+.0f}%")
             else:
-                print(base + "｜選股 α:樣本/持倉不足以判定能力,先看行為層(拆帳見下)")
+                print(base + "｜選股 α:樣本/持倉不足以判定能力,先看行為層(α 為何不可判,見下)")
         elif ab and ab.get("note"):
             print(f"  α/β:{ab['note']}")
     if best and worst:                             # 做得最好 / 最差的一筆具體交易
