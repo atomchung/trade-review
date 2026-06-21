@@ -120,6 +120,44 @@ def test_offline_pipeline_no_crash():
     assert tr.what_if(held, None) is None  # 無價格 → what-if 直接 None,不爆
 
 
+def test_split_adjustment_dollar_invariant():
+    """分割調整:股數×因子、價格÷因子 → 成交金額不變,且跨分割 round-trip 不再假 orphan。
+
+    確定性(無網路):用合成 splits dict 驗算術。NVDA 2024/6 做 10:1,分割前買、分割後賣。
+    """
+    import datetime as dt
+    rows = [dict(ticker="NVDA", side="buy", qty=10, price=1200.0, date=dt.date(2024, 1, 1)),
+            dict(ticker="NVDA", side="sell", qty=100, price=120.0, date=dt.date(2024, 7, 1))]
+    splits = {"NVDA": [(dt.date(2024, 6, 10), 10.0)]}     # 10:1
+    n = tr.adjust_for_splits(rows, splits)
+    assert n == 1                                          # 只有分割前那筆被調整
+    # 分割前的買:股數 10→100、價 1200→120,金額 12000 不變
+    assert abs(rows[0]["qty"] - 100) < 1e-6
+    assert abs(rows[0]["price"] - 120.0) < 1e-6
+    assert abs(rows[0]["qty"] * rows[0]["price"] - 12000) < 1e-6
+    # 分割後的賣:不動
+    assert abs(rows[1]["qty"] - 100) < 1e-6 and abs(rows[1]["price"] - 120.0) < 1e-6
+    # 調整後:1 個乾淨 round-trip、ret≈0(其實打平)、無假 orphan
+    rts, _ = tr.round_trips(rows)
+    assert len(rts) == 1 and abs(rts[0]["ret"]) < 1e-6
+    assert tr.orphan_sells(rows) == {}
+
+
+def test_driver_map_partial_tolerance():
+    """driver map 逐筆容錯:一筆格式壞不該丟掉整張 map。"""
+    import json, tempfile, os as _os
+    tr._DRIVER_MAP = dict(tr.DRIVER_FALLBACK)
+    bad = {"AAA": ["核電", 1], "BBB": "壞格式", "CCC": ["能源", 0]}   # BBB 缺 thematic
+    fd, p = tempfile.mkstemp(suffix=".json")
+    with _os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(bad, f)
+    ok = tr.load_driver_map(p)
+    _os.unlink(p)
+    assert ok == 2 and tr._DM_SKIPPED == 1                # 好的 2 筆收下、壞的 1 筆跳過
+    assert tr.driver("AAA") == ("核電", 1) and tr.driver("CCC") == ("能源", 0)
+    tr._DRIVER_MAP = dict(tr.DRIVER_FALLBACK)             # 還原,免污染其他測試
+
+
 # ─────────────────────── 選配:network smoke(β 方向)───────────────────────
 
 def test_beta_direction_network():
