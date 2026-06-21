@@ -485,6 +485,51 @@ def dim_avgdown(avg_down, held, last_px, size_dim):
     return dict(dim="加碼攤平", tier=1, triggered=(breach >= 1),
                 severity=sev, count=cnt, breach=breach, tickers=tickers)
 
+# ── 【風格】維雛形(v2a,解鎖 v2c 誠實閥)──────────────────────────────────────
+# 與普世維不同:這維不是「洞」,是『風格軸』——各派對它給相反 stance(動能派稱讚追高、
+# 價值派斥責追高)。研究依據與設計見 docs/style-detection-research.md。先不接 lens/閥,
+# 只算訊號 + 印讀數,驗算得準不準。
+MIN_ENTRY_BUYS = 15        # 研究:n≳15 才分得開 0.65(動能) vs 0.50(中性);不足 → 低信賴
+ENTRY_LOOKBACK = 252       # 52 週 = 一年交易日(George-Hwang 錨)
+
+def dim_entry_style(rows, data, lookback=ENTRY_LOOKBACK):
+    """進場相對位置(追高 vs 抄底):每筆 BUY 在過去一年價格區間的位置。
+    range_pct≈1 = 買在區間頂(追高/動能, lean=strength);≈0 = 買在區間底(抄底/逆勢, lean=weakness)。
+    紀律:① point-in-time(只用進場前的價,防 look-ahead)② 只報方向不報精確值(漂移容錯)
+    ③ 樣本不足回低信賴 ④ 對事不對人——這是風格不是洞。
+    依賴 adjust_for_splits 已把成交價對齊今日基礎,否則跨分割的區間會錯 10 倍。"""
+    if data is None:
+        return dict(dim="進場", axis="style", tier=2, triggered=False, severity=0,
+                    lean=None, n=0, low_conf=True, note="無價格(需 yfinance)")
+    import pandas as pd
+    cols = set(getattr(data, "columns", []))
+    pcts, forms = [], []
+    for r in rows:
+        if r["side"] != "buy" or r["ticker"] not in cols:
+            continue
+        col = data[r["ticker"]].dropna()
+        prior = col[col.index < pd.Timestamp(r["date"])].tail(lookback)   # 只用進場前的價
+        if len(prior) < 30:                                               # 歷史太短不定位
+            continue
+        lo, hi = float(prior.min()), float(prior.max())
+        if hi - lo < 1e-9:
+            continue
+        pcts.append(min(max((r["price"] - lo) / (hi - lo), 0.0), 1.0))
+        forms.append(r["price"] / float(prior.iloc[0]) - 1)               # 形成期報酬(窗起→進場)
+    n = len(pcts)
+    if n == 0:
+        return dict(dim="進場", axis="style", tier=2, triggered=False, severity=0,
+                    lean=None, n=0, low_conf=True, note="無可定位的買入")
+    med = statistics.median(pcts)
+    low_conf = n < MIN_ENTRY_BUYS
+    lean = "strength" if med > 0.70 else "weakness" if med < 0.30 else None
+    sev = min(max(abs(med - 0.5) * 2, 0), 1)
+    if low_conf:
+        sev *= 0.7
+    return dict(dim="進場", axis="style", tier=2, triggered=(lean is not None and not low_conf),
+                severity=sev, lean=lean, median_pct=med,
+                median_form=statistics.median(forms), n=n, low_conf=low_conf)
+
 # ─────────────────────────── 6. 卡片選擇 + 渲染 ───────────────────────────
 # ── 鏡片層(可換大師):洞的「規矩 + 引言」來自 lens 檔,engine 不 hardcode VY ──
 _LENS = None
@@ -818,6 +863,19 @@ def main():
     tdiag = ticker_diagnosis(rts, adds_class, held, last_px)  # 標的層:按金額排序,對事不對人
     render(dims, strength, overview, best, worst, wi, trend, rx, tdiag)
     print_alpha_beta(ab)
+    d_entry = dim_entry_style(rows, px)                    # 【風格】維雛形(不進洞排序,先驗訊號)
+    print("\n" + "─"*60)
+    print("  〔風格雛形 · 進場相對位置(對事不對人,只報方向;閥未接)〕")
+    if d_entry.get("note"):
+        print(f"    {d_entry['note']}——這維要 yfinance 日線才算得出")
+    else:
+        zh = {"strength": "偏追高/順勢——買在區間高位(動能派視為策略、價值派視為追高)",
+              "weakness": "偏抄底/逆勢——買在區間低位(價值派視為紀律、動能派視為接刀)",
+              None: "無明顯方向(中性)"}
+        conf = "樣本足" if not d_entry["low_conf"] else f"低信賴:可定位買入僅 {d_entry['n']} 筆(<{MIN_ENTRY_BUYS})"
+        print(f"    {zh[d_entry['lean']]}")
+        print(f"    進場區間位置中位 {d_entry['median_pct']*100:.0f}%（{d_entry['n']} 筆 · {conf}）"
+              f" lean={d_entry['lean'] or '—'}")
     notes = []                                             # 資料完整性提示統一收在最後,不干擾上面的洞
     orphans = orphan_sells(rows)
     if orphans:

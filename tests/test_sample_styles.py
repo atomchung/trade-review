@@ -158,6 +158,47 @@ def test_driver_map_partial_tolerance():
     tr._DRIVER_MAP = dict(tr.DRIVER_FALLBACK)             # 還原,免污染其他測試
 
 
+def test_entry_style_chase_vs_dip():
+    """【風格】維雛形:追高 vs 抄底,用合成價格 fixture 驗(確定性、離線、不碰 yfinance)。
+
+    chase:單調上升、買在新高 → range_pct≈1 → lean=strength。
+    dip:先在 150~250 震盪建出區間、後段壓低,買在低檔 → range_pct 低 → lean=weakness。
+    """
+    import math, datetime as dt
+    try:
+        import pandas as pd
+    except ImportError:
+        return _SKIP                                      # 無 pandas → 跳過(這維本來就需要它)
+    idx = pd.bdate_range("2023-01-01", periods=300)
+
+    # ── chase:單調上升,後段每兩天買一筆(此時價格史已 >252)──
+    rising = pd.Series([100 + i * 0.3 for i in range(300)], index=idx)
+    px_up = pd.DataFrame({"AAA": rising})
+    buys_up = [dict(ticker="AAA", side="buy", qty=1, price=float(rising.iloc[i]),
+                    date=idx[i].date()) for i in range(260, 300, 2)]
+    d = tr.dim_entry_style(buys_up, px_up)
+    assert d["lean"] == "strength", f"追高應判 strength,實得 {d['lean']}（pct={d['median_pct']:.2f}）"
+    assert d["median_pct"] > 0.70
+
+    # ── dip:前段 150~250 震盪(撐出區間),後段壓在 165,買在低檔 ──
+    vals = [200 + 50 * math.sin(i / 10.0) if i < 252 else 165.0 for i in range(300)]
+    s = pd.Series(vals, index=idx)
+    px_dn = pd.DataFrame({"BBB": s})
+    buys_dn = [dict(ticker="BBB", side="buy", qty=1, price=165.0, date=idx[i].date())
+               for i in range(260, 300)]
+    d2 = tr.dim_entry_style(buys_dn, px_dn)
+    assert d2["lean"] == "weakness", f"抄底應判 weakness,實得 {d2['lean']}（pct={d2['median_pct']:.2f}）"
+    assert d2["median_pct"] < 0.30
+
+    # ── 樣本不足 → 低信賴、不 triggered(但 lean 仍可算)──
+    d3 = tr.dim_entry_style(buys_up[:3], px_up)
+    assert d3["low_conf"] and not d3["triggered"]
+
+    # ── 無價格 → 優雅降級,不 crash ──
+    d4 = tr.dim_entry_style(buys_up, None)
+    assert d4["lean"] is None and d4["low_conf"]
+
+
 # ─────────────────────── 選配:network smoke(β 方向)───────────────────────
 
 def test_beta_direction_network():
