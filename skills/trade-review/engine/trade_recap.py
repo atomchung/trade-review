@@ -126,6 +126,22 @@ def positions(rows):
     held = {t: (sh, c) for t, (sh, c) in pos.items() if sh > 1e-6}
     return held, avg_down
 
+def current_cycles(rows):
+    """每個當前持倉 ticker 的 position cycle 起始日 + 序號(第幾次建倉)。與 positions() 同累加邏輯
+    (sell 只在有倉時減 → 不跌負),所以 cycle 判定跟持倉一致(雙審 gemini#1:修負數誤判 + codex#4:單一 ledger)。
+    序號讓同 ticker 清倉後重建不撞 id(雙審 codex#3)。CSV 缺期初持倉 → 該 ticker 不在 return,呼叫端標 #unknown。"""
+    sh = defaultdict(float); seq = defaultdict(int); start = {}
+    for r in rows:
+        t = r["ticker"]
+        if r["side"] == "buy":
+            if sh[t] <= 1e-9:                       # 從 0 建倉 = 新 cycle
+                seq[t] += 1; start[t] = r["date"].isoformat()
+            sh[t] += r["qty"]
+        elif sh[t] > 1e-9:                          # 同 positions():只在有倉時減,不跌負
+            sh[t] -= r["qty"]
+            if sh[t] <= 1e-9: start.pop(t, None)    # 清倉 → cycle 結束
+    return {t: {"start": start[t], "seq": seq[t]} for t in start}
+
 def classify_adds(rows, min_adds=3):
     """主從分類每個標的的加碼:疑似定投(漲跌都買/規律) vs 疑似凹單(只虧損買+金額加速) vs 待確認。
     codex+gemini review 定稿:主從不投票;『價格無關 + 時間規律』為主、金額一致性最易誤判只當輔助;
@@ -813,21 +829,14 @@ def build_state(rows, rts, held, dims, overview, ab, rx):
                        "部位上限": ("max_pos_pct", d_size.get("max_pct"))}  # sizing:追蹤最大持倉佔比(降=進步)
         mk, mv = next(((k, v) for kw, (k, v) in RULE_METRIC.items() if kw in rule), (None, None))
         commitment = {"rule": rule, "metric_key": mk, "metric_value": mv, "goal": "down"}
-    # holdings snapshot（目標3 持倉變化）：per-ticker 絕對值 + 當前 position cycle 起始（給 thesis 綁 cycle）。
-    # 只存 shares/cost/avg_cost（確定性）；不存 weight/市值（沒現金+即時報價算不準，雙審 gemini#4）。
-    _sh, _cyc = defaultdict(float), {}
-    for _r in rows:
-        _t = _r["ticker"]
-        if _r["side"] == "buy":
-            if _sh[_t] <= 1e-9: _cyc[_t] = _r["date"].isoformat()   # 從 0 建倉 = 新 position cycle
-            _sh[_t] += _r["qty"]
-        else:
-            _sh[_t] -= _r["qty"]
-            if _sh[_t] <= 1e-9: _cyc.pop(_t, None)                  # 清倉 → cycle 結束
+    # holdings snapshot（目標3 持倉變化）：per-ticker 絕對值 + position cycle（給 thesis 綁 cycle）。
+    # 只存 shares/cost/avg_cost（確定性）；不存 weight（沒現金+即時價算不準，雙審 gemini#4）。
+    cyc = current_cycles(rows)                              # 雙審修：與 positions() 同邏輯（不跌負）+ cycle 序號
     holdings = {t: {"shares": round(sh, 4), "cost": round(c, 2),
                     "avg_cost": round(c / sh, 4) if sh > 1e-9 else None,
-                    "cycle_start": _cyc.get(t),
-                    "cycle_id": f"{t}#{_cyc.get(t)}" if _cyc.get(t) else t}
+                    "cycle_start": cyc.get(t, {}).get("start"),
+                    # 算不出開倉（CSV 缺期初持倉）→ 標 #unknown，不 fallback 裸 ticker（雙審 codex#4）
+                    "cycle_id": f"{t}#{cyc[t]['start']}#{cyc[t]['seq']}" if t in cyc else f"{t}#unknown"}
                 for t, (sh, c) in held.items()}
     return {
         "schema_version": 2,
