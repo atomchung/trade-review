@@ -123,6 +123,14 @@ def main():
     ok.append(("對帳敘述引用了上次承諾的 metric_key", last_commit_mk and last_commit_mk in l2))
     ok.append(("log.jsonl 累積了兩輪(記憶+持續)",
                sum(1 for _ in open(log, encoding="utf-8")) == 2))
+    # Phase B：holdings snapshot（目標3）回歸保護 + 守雙審採納
+    ok.append(("state schema v2 + 有 holdings snapshot",
+               st2.get("schema_version") == 2 and bool(st2.get("holdings", {}).get("positions"))))
+    ok.append(("holdings 每檔有 cycle_id + 絕對值、不含 weight（雙審 gemini#4）",
+               all("cycle_id" in p and "shares" in p and "weight" not in p
+                   for p in st2["holdings"]["positions"].values())))
+    ok.append(("holdings 標 is_complete=False（不宣稱完整持倉，雙審 codex#3）",
+               st2["holdings"].get("is_complete") is False))
 
     print("── 驗收 ──")
     allok = True
