@@ -813,8 +813,24 @@ def build_state(rows, rts, held, dims, overview, ab, rx):
                        "部位上限": ("max_pos_pct", d_size.get("max_pct"))}  # sizing:追蹤最大持倉佔比(降=進步)
         mk, mv = next(((k, v) for kw, (k, v) in RULE_METRIC.items() if kw in rule), (None, None))
         commitment = {"rule": rule, "metric_key": mk, "metric_value": mv, "goal": "down"}
+    # holdings snapshot（目標3 持倉變化）：per-ticker 絕對值 + 當前 position cycle 起始（給 thesis 綁 cycle）。
+    # 只存 shares/cost/avg_cost（確定性）；不存 weight/市值（沒現金+即時報價算不準，雙審 gemini#4）。
+    _sh, _cyc = defaultdict(float), {}
+    for _r in rows:
+        _t = _r["ticker"]
+        if _r["side"] == "buy":
+            if _sh[_t] <= 1e-9: _cyc[_t] = _r["date"].isoformat()   # 從 0 建倉 = 新 position cycle
+            _sh[_t] += _r["qty"]
+        else:
+            _sh[_t] -= _r["qty"]
+            if _sh[_t] <= 1e-9: _cyc.pop(_t, None)                  # 清倉 → cycle 結束
+    holdings = {t: {"shares": round(sh, 4), "cost": round(c, 2),
+                    "avg_cost": round(c / sh, 4) if sh > 1e-9 else None,
+                    "cycle_start": _cyc.get(t),
+                    "cycle_id": f"{t}#{_cyc.get(t)}" if _cyc.get(t) else t}
+                for t, (sh, c) in held.items()}
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "date_start": rows[0]["date"].isoformat() if rows else None,
         "date_end": rows[-1]["date"].isoformat() if rows else None,
         "n_trades": len(rows),
@@ -839,6 +855,12 @@ def build_state(rows, rts, held, dims, overview, ab, rx):
         },
         "rule": rule,
         "insufficient_data": insufficient,
+        "holdings": {                                       # 目標3：持倉 snapshot（絕對值，跨期 diff 用）
+            "as_of": rows[-1]["date"].isoformat() if rows else None,
+            "derived_from": "trades_csv",                   # 從交易推算，可能漏期初持倉
+            "is_complete": False,                           # CSV 無法自證完整（雙審 codex#3）：不宣稱完整持倉真相
+            "positions": holdings,
+        },
     }
 
 # ─────────────────────────── main ───────────────────────────
