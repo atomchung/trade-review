@@ -656,7 +656,7 @@ def what_if(held, last_px, threshold=0.25):
     # 候選清單(只收 ≥ threshold 的;label/mval/pct)
     cands = []
     if ai_pct >= threshold:
-        cands.append(("AI capex 主題(跨板塊)", ai_mv, ai_pct, "AI 主題回檔"))
+        cands.append(("AI 概念股(跨板塊)", ai_mv, ai_pct, "AI 概念股回檔"))
     if max_sec and max_sec_pct >= threshold:
         # 若 AI thematic 已是候選且涵蓋了這個 sector,避免重複(AI 通常 ≥ max_sec)
         if not (ai_pct >= threshold and ai_pct >= max_sec_pct):
@@ -916,7 +916,7 @@ def render(dims, strength=None, overview=None, best=None, worst=None, wi=None, t
 
     # 5 維行為診斷 — 用 bar 取代「sev=0.80 ×tier1」內部加權公式
     parts.append(Rule(style="dim cyan"))
-    parts.append(Padding(Text("5 維行為診斷  ·  bar 長 = 嚴重度 × 維度權重", style="bold"), (0, 1)))
+    parts.append(Padding(Text("5 維行為診斷  ·  bar 越長代表這項對你影響越大,紅色 = 已觸發", style="bold"), (0, 1)))
     dim_tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False, expand=False)
     dim_tbl.add_column(width=1, no_wrap=True)            # ● ○
     dim_tbl.add_column(width=11, no_wrap=True)           # 維度名（夠塞「部位 sizing」）
