@@ -92,6 +92,19 @@ def coach_turn(state, log_path):
 def main():
     src = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CSV
     cutoff = sys.argv[2] if len(sys.argv) > 2 else "2024-07-01"
+
+    # current_cycles 邊界單元測（雙審 codex：補 oversell/重建/缺期初，不只檢查欄位存在）
+    from trade_recap import current_cycles
+    def _R(t, s, q, d): return {"ticker": t, "side": s, "qty": q, "date": dt.date.fromisoformat(d)}
+    _c = current_cycles([_R("X","buy",10,"2024-01-01"), _R("X","sell",50,"2024-02-01"),
+                         _R("X","buy",5,"2024-03-01"), _R("X","buy",5,"2024-03-15")])
+    assert _c.get("X") == {"start":"2024-03-01","seq":2}, f"oversell 污染 cycle: {_c}"   # 舊 bug：sh 跌負→seq=3
+    _c = current_cycles([_R("Y","buy",10,"2024-01-01"), _R("Y","sell",10,"2024-02-01"), _R("Y","buy",5,"2024-03-01")])
+    assert _c.get("Y") == {"start":"2024-03-01","seq":2}, f"清倉重建 seq: {_c}"
+    _c = current_cycles([_R("Z","sell",50,"2024-01-01"), _R("Z","buy",10,"2024-02-01")])
+    assert _c.get("Z") == {"start":"2024-02-01","seq":1}, f"缺期初: {_c}"
+    print("✅ current_cycles 邊界（oversell / 清倉重建 / 缺期初）全過\n")
+
     tmp = tempfile.mkdtemp(prefix="tr_state_test_")
     seg1, seg2 = os.path.join(tmp, "seg1.csv"), os.path.join(tmp, "seg2.csv")
     log = os.path.join(tmp, "log.jsonl")
@@ -123,6 +136,14 @@ def main():
     ok.append(("對帳敘述引用了上次承諾的 metric_key", last_commit_mk and last_commit_mk in l2))
     ok.append(("log.jsonl 累積了兩輪(記憶+持續)",
                sum(1 for _ in open(log, encoding="utf-8")) == 2))
+    # Phase B：holdings snapshot（目標3）回歸保護 + 守雙審採納
+    ok.append(("state schema v2 + 有 holdings snapshot",
+               st2.get("schema_version") == 2 and bool(st2.get("holdings", {}).get("positions"))))
+    ok.append(("holdings 每檔有 cycle_id + 絕對值、不含 weight（雙審 gemini#4）",
+               all("cycle_id" in p and "shares" in p and "weight" not in p
+                   for p in st2["holdings"]["positions"].values())))
+    ok.append(("holdings 標 is_complete=False（不宣稱完整持倉，雙審 codex#3）",
+               st2["holdings"].get("is_complete") is False))
 
     print("── 驗收 ──")
     allok = True
