@@ -294,6 +294,21 @@ def test_build_state_insufficient_sample_no_commitment():
     assert st["commitment"] is None, "樣本不足不該出 commitment"
 
 
+# ─────────────────────── J. prescribe():#29 能產 ≥2 候選規矩 ───────────────────────
+
+def test_prescribe_multiple_candidate_rules():
+    """#29:攤平(breach≥1)與單筆過重(max_pct>0.30)同時觸發時,prescribe 應給 ≥2 條帶 rule 的候選。
+    這釘住『解開互斥 gate』——若退回 sizing 被 `not any(kind=='砍損耗')` 擋掉,只剩 1 條,
+    candidate_rules 的『2-3 條候選』又會變成兌現不了的死承諾(原 review finding pr23-f1)。"""
+    dims = [
+        dict(dim="加碼攤平", count=12, breach=2),                  # 觸發攤平 rule
+        dict(dim="部位 sizing", max_pct=0.55, max_ticker="NVDA"),  # 觸發 sizing rule
+    ]
+    rx = tr.prescribe(None, dims, {})        # ab=None → 跳過 alpha/beta 段,只看處方互斥
+    rules = [r for r in rx if r.get("rule")]
+    assert len(rules) >= 2, f"#29:兩條都觸發應給 ≥2 條候選 rule,實得 {len(rules)}: {[r.get('kind') for r in rx]}"
+
+
 # ─────────────────── 標準庫 runner(免 pytest 即可跑,與 test_sample_styles 一致)───────────────────
 
 def _main():

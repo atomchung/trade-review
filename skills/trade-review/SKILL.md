@@ -66,7 +66,7 @@ TR_JSON=1 TR_STATE_OUT=~/.trade-coach/last_state.json python3 engine/trade_recap
 ```
 引擎吃標準欄位(Symbol / Action(BUY|SELL) / Quantity / Price / TradeDate),`TR_JSON=1` 吐的結構含:
 - **`top_holes`**:已選好的 top 1–2 機械洞 + 對應鏡片 quote(融入敘事,**別當結語**)。
-- **`candidate_rules`**:候選規矩(引擎目前多半給一條;有幾條就呈現幾條,跟用戶確認/改一條,別硬湊)。
+- **`candidate_rules`**:2–3 條候選規矩(Step 3 跟用戶挑/改一條,**別只給第一條**;引擎只給一條時就用那條)。
 - **`thesis_questions`**:per-ticker 持股假設問句 — **這是給 Step 2 對話用的,絕不准印在卡上**(SKILL 鐵律:確認在出卡之前)。
 - **`alpha_beta_breakdown` / `payoff_attribution` / `ticker_diagnosis`**:完整數字,你拿去組敘事。
 - **`dims_raw`**:5 維行為診斷(每維 severity 0–1)— **別整張攤出來**,用「一句人話」帶過非 headline 的維度(SKILL 鐵律:不放 5 維小數表)。
@@ -160,7 +160,7 @@ TR_JSON=1 TR_STATE_OUT=~/.trade-coach/last_state.json python3 engine/trade_recap
 - ❌ 5 維 severity 小數表(`.64 🔴`)— 用「一句人話」帶過非 headline 維度
 - ❌ `thesis_questions` 任何一條 — 那是 Step 2 對話用的,卡上只有用戶答完的定論
 - ❌ 鏡片 `lens_quote` 當每漏洞段尾結語 — 融進敘事或徹底不用
-- ❌ 把規矩當定論硬塞 — 用 `candidate_rules` 的候選跟用戶確認/改一條(目前多半一條,就用那條,別硬湊多條)
+- ❌ 把你寫的規矩當定論硬塞 — 從 `candidate_rules` 給 2-3 條候選讓用戶挑/改(引擎只給一條時就用那條)
 - ❌ `(引擎產出)` 或任何內部分工標記
 
 **先分兩種卡(雙審:社群分發的命)**:
@@ -201,7 +201,7 @@ TR_JSON=1 TR_STATE_OUT=~/.trade-coach/last_state.json python3 engine/trade_recap
    ▫ 看動機:{用戶剛在 Step 2 確認的 why}
    ▫ what if:{引擎算的具體情境,給數字讓他自己想——不准「會一起倒」這種空話}   ← 點3
 
-▸ 下次只改這一件:{candidate_rules 給的具體 if-then,跟用戶確認/改;目前多半一條}    ← 點2
+▸ 下次只改這一件:{candidate_rules 的具體 if-then,2–3 條候選讓他挑/改一條}    ← 點2
 ▸ {philosophy}:「{lens 的 quote 原話}」
 ```
 
@@ -230,7 +230,7 @@ TR_JSON=1 TR_STATE_OUT=~/.trade-coach/last_state.json python3 engine/trade_recap
 - **if-then 規矩由你(Claude)幫他寫具體,不要丟抽象句**(點2:「AI 幫人寫規矩」):
   - 抽象(❌):「注意分散」「加碼前想清楚」——用戶下次還是不知道怎麼做。
   - 具體(✅):用他的數字寫成「下次引擎能驗」的:「把 AI 部位從 95% 砍到 70% 以下」/「為 MU(37%)掛一個跌破 $X 就減半的條件單」/「往下加碼前在卡上寫一行新證據,寫不出就不加」。
-  - **用 `candidate_rules` 的候選跟他確認 / 改一條**(目前引擎多半給一條),別逼他接受你寫的。用戶說不出具體規矩,但能從選項裡認出「對,就是這個」——這就是 AI 幫人寫規矩。
+  - **給 2–3 條候選讓他挑一條 / 改一條**,別逼他接受你寫的。用戶說不出具體規矩,但能從選項裡認出「對,就是這個」——這就是 AI 幫人寫規矩。
 - **永遠只收斂到一個洞 + 一條規矩**。第二份十維報告 = 失敗。
 - 引言用 `rubric/vincent-yu.lens.json` 裡**那個洞對應 dim 的 `quote`**;**換鏡片/哲學 = 換 lens 檔,這步不動**。
 

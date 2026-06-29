@@ -841,7 +841,7 @@ def prescribe(ab, dims, overview):
                        rule="虧損部位一律不加碼;真想加,先整筆賣掉隔天重買(逼你重新面對『現在還會買它嗎』)",
                        text=f"虧損中加碼 {ad.get('count', 0)} 次是你操盤損耗的大宗——這是最該先砍的純扣分動作。"))
     sz = dd.get("部位 sizing", {})
-    if sz.get("max_pct", 0) > 0.30 and not any(r["kind"] == "砍損耗" for r in rx):
+    if sz.get("max_pct", 0) > 0.30:                          # #29:解開互斥 gate,攤平與 sizing 可同時成候選(讓 candidate_rules 能 2-3 條)
         rx.append(dict(kind="砍損耗", verify="單筆最大佔比(降→好)",
                        rule=f"單筆部位上限定死 20%,超過就減",
                        text=f"最大一筆 {sz.get('max_ticker')} 佔 {sz.get('max_pct', 0)*100:.0f}%,單一押注過重。"))
@@ -1095,11 +1095,23 @@ def render(dims, strength=None, overview=None, best=None, worst=None, wi=None, t
             rx_tbl.add_row(Text("▸", style="bold"), cell)
         parts.append(Padding(rx_tbl, (0, 1)))
         actionable = [r for r in rx if r.get("rule")]
-        if actionable:                                  # 引擎目前最多給一條處方規矩(讓 prescribe 產 2-3 候選的改法見 issue)
-            star_hdr = Text("\n★ 下次只改這一件 ", style="bold yellow")
-            star_hdr.append("(可立即執行 + 可驗)", style="dim yellow")
-            parts.append(Padding(star_hdr, (0, 1)))
-            parts.append(Padding(Text(actionable[0]['rule'], style="bold"), (0, 3)))
+        if actionable:
+            n = min(len(actionable), 3)
+            if n == 1:                                  # 只 1 條 → 單行(避免「從這 1 條候選挑」語意怪)
+                star_hdr = Text("\n★ 下次只改這一件 ", style="bold yellow")
+                star_hdr.append("(可立即執行 + 可驗)", style="dim yellow")
+                parts.append(Padding(star_hdr, (0, 1)))
+                parts.append(Padding(Text(actionable[0]['rule'], style="bold"), (0, 3)))
+            else:                                       # 2-3 條候選讓用戶挑/改一條(#29:prescribe 已能產多條)
+                star_hdr = Text("\n★ 下次只改這一件 ", style="bold yellow")
+                star_hdr.append(f"(從這 {n} 條候選挑/改一條)", style="dim yellow")
+                parts.append(Padding(star_hdr, (0, 1)))
+                cand_tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False, expand=False)
+                cand_tbl.add_column(width=2, no_wrap=True)
+                cand_tbl.add_column(overflow="fold")
+                for i, r in enumerate(actionable[:3], 1):
+                    cand_tbl.add_row(Text(f"{i}.", style="bold yellow"), Text(r['rule'], style="bold"))
+                parts.append(Padding(cand_tbl, (0, 3)))
 
     _console.print()
     _console.print(Panel(
@@ -1207,7 +1219,7 @@ def build_state(rows, rts, held, dims, overview, ab, rx):
 
 # ─────────────────── 結構化 card data(給 Claude 寫敘事卡用)───────────────────
 def build_card_data(dims, strength, overview, best, worst, wi, rx, tdiag,
-                    ab, pa, master, is_demo=False):
+                    ab, pa, master, is_demo=False, data_integrity=None):
     """組裝 SKILL Step 3「定論卡」要用的結構化資料(JSON,非給人看的卡)。
 
     Claude 拿這 dict 用敘事方式寫成一段連貫卡(SKILL.md Step 3 鐵律:連貫敘事 ≠ dashboard 拼接);
@@ -1217,7 +1229,7 @@ def build_card_data(dims, strength, overview, best, worst, wi, rx, tdiag,
     對應 issue #20 七條規格鐵律破洞 — 把渲染責任從 engine 移到 Claude:
     - thesis_questions 包出來但標明只在 Step 2 對話用(SKILL L77-79「確認在出卡之前」)
     - top_holes 帶 lens_quote 但別當結語用(SKILL L192)
-    - candidate_rules:引擎目前最多給一條處方規矩;Step 3 有幾條就用幾條(讓 prescribe 產 2-3 候選的改法見 issue)
+    - candidate_rules:2-3 條候選規矩(Step 3 讓用戶挑/改一條,別只給第一條;#29 已讓 prescribe 能產多條)
     - dims_raw 5 維給結構化資料,讓 Claude「一句人話帶過其餘維」(SKILL L158-159)
     - is_demo 標明 → mock 卡頭應加 [demo · 非真實成績]
     """
@@ -1239,7 +1251,7 @@ def build_card_data(dims, strength, overview, best, worst, wi, rx, tdiag,
             "raw": d,
         })
 
-    # 候選規矩:引擎目前最多給一條(prescribe 結構所限);[:3] 保留以備未來多候選(見 issue)
+    # 候選規矩:2-3 條候選(#29 解開互斥 gate 後可多條),Step 3 跟用戶挑/改一條
     candidate_rules = [r for r in (rx or []) if r.get("rule")][:3]
 
     # ⚠️ thesis_questions 給 Step 2 對話用,絕不准印在卡上(SKILL L77-79「確認在出卡之前」)
@@ -1258,11 +1270,12 @@ def build_card_data(dims, strength, overview, best, worst, wi, rx, tdiag,
         "ticker_diagnosis": tdiag,                          # tags 已是人話
         "thesis_questions": thesis_questions,               # ⚠️ Step 2 對話用,不准印卡上
         "top_holes": top_holes,                             # top 1-2,Claude 寫敘事用
-        "candidate_rules": candidate_rules,                 # 目前多半一條,讓用戶確認/改(未來多條再讓他挑)
+        "candidate_rules": candidate_rules,                 # 2-3 條候選,讓用戶挑/改一條
         "prescriptions": rx,                                # 完整處方層
         "alpha_beta_breakdown": ab,
         "payoff_attribution": pa,
         "dims_raw": dims,                                   # 5 維 raw,Claude 用「一句人話」帶過其餘維
+        "data_integrity": data_integrity or {},             # 賣超/未分類 driver — 影響數據可信度,Claude 該主動提
     }
 
 # ─────────────────────────── main ───────────────────────────
@@ -1301,6 +1314,14 @@ def main():
     adds_class = classify_adds(rows)                       # 主從分類:疑似定投 vs 凹單 vs 待確認
     tdiag = ticker_diagnosis(rts, adds_class, held, last_px)  # 標的層:按金額排序,對事不對人
 
+    # 資料完整性(賣超 / 未分類 driver)— 影響數據可信度,JSON 與人話卡共用同一份
+    orphans = orphan_sells(rows)
+    unclassified = sorted(t for t in held if driver(t)[0] == "未分類")
+    data_integrity = {
+        "orphan_sells": {t: round(q, 2) for t, q in sorted(orphans.items())},
+        "unclassified_drivers": unclassified,
+    }
+
     dm_skip = f"({_DM_SKIPPED} 筆格式錯跳過)" if _DM_SKIPPED else ""
     split_note = f"｜分割調整: {n_adj} 筆" if n_adj else ""
     # JSON 模式(SKILL Step 3 走這條):stdout 純 JSON 給 Claude 寫敘事卡;meta 走 stderr 不污染
@@ -1313,7 +1334,7 @@ def main():
                 + ("｜⚠️ DEMO 模式" if is_demo else ""))
         print(meta, file=sys.stderr)
         card = build_card_data(dims, strength, overview, best, worst, wi, rx, tdiag,
-                               ab, pa, master, is_demo=is_demo)
+                               ab, pa, master, is_demo=is_demo, data_integrity=data_integrity)
         print(json.dumps(card, ensure_ascii=False, indent=2, default=str))
     else:
         # 預設:乾淨人話卡(demo / fallback 用,#20 違規條目已砍)
@@ -1343,13 +1364,11 @@ def main():
             print(f"    {zh[d_entry['lean']]}")
             print(f"    進場區間位置中位 {d_entry['median_pct']*100:.0f}%（{d_entry['n']} 筆 · {conf}）"
                   f" lean={d_entry['lean'] or '—'}")
-        notes = []                                        # 資料完整性提示統一收在最後,不干擾上面的洞
-        orphans = orphan_sells(rows)
+        notes = []                                        # 資料完整性提示統一收在最後(orphans/unclassified 已於上方算好)
         if orphans:
             names = ", ".join(f"{t}({q:.0f} 股)" for t, q in sorted(orphans.items()))
             notes.append(f"{len(orphans)} 檔『賣超』(賣量 > 已知買量):{names}"
                          f"——多半是對帳單沒涵蓋最早建倉,已從盈虧忽略(做空支援另議)")
-        unclassified = sorted(t for t in held if driver(t)[0] == "未分類")
         if unclassified:
             more = f" 等 {len(unclassified)} 檔" if len(unclassified) > 8 else ""
             notes.append(f"{', '.join(unclassified[:8])}{more} 未分類 driver——分散維可能偏樂觀,"
