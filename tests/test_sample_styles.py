@@ -100,6 +100,105 @@ def test_three_styles_have_distinct_top_holes():
     assert holes["fundamental"] != holes["value"] != holes["momentum"]
 
 
+def test_offline_pipeline_no_crash():
+    """離線(無 yfinance,last_px=None)時,卡片層全鏈路不得 crash。
+
+    回歸守門:ticker_diagnosis / overview_stats / what_if 都吃 last_px,
+    只要 yfinance 沒裝或下載失敗 last_px 就是 None。先前 ticker_diagnosis
+    沒 guard None → main() 在最後一步崩潰,而本檔測試只跑 dim_* 沒跑這層,
+    所以紅燈被掩蓋。這個測試把『成本基礎(last_px=None)』全鏈路跑一遍。
+    """
+    s = _dims("momentum")
+    rows, rts = s["rows"], s["rts"]
+    held, avg_down = tr.positions(rows)
+    adds = tr.classify_adds(rows)
+    # last_px=None 不得 crash(降級成只用已實現/成本基礎)
+    tdiag = tr.ticker_diagnosis(rts, adds, held, None)
+    assert isinstance(tdiag, list)
+    ov = tr.overview_stats(rts, {}, held, None)
+    assert ov["unrealized"] == 0          # 無價格 → 未實現視為 0,不爆
+    assert tr.what_if(held, None) is None  # 無價格 → what-if 直接 None,不爆
+
+
+def test_split_adjustment_dollar_invariant():
+    """分割調整:股數×因子、價格÷因子 → 成交金額不變,且跨分割 round-trip 不再假 orphan。
+
+    確定性(無網路):用合成 splits dict 驗算術。NVDA 2024/6 做 10:1,分割前買、分割後賣。
+    """
+    import datetime as dt
+    rows = [dict(ticker="NVDA", side="buy", qty=10, price=1200.0, date=dt.date(2024, 1, 1)),
+            dict(ticker="NVDA", side="sell", qty=100, price=120.0, date=dt.date(2024, 7, 1))]
+    splits = {"NVDA": [(dt.date(2024, 6, 10), 10.0)]}     # 10:1
+    n = tr.adjust_for_splits(rows, splits)
+    assert n == 1                                          # 只有分割前那筆被調整
+    # 分割前的買:股數 10→100、價 1200→120,金額 12000 不變
+    assert abs(rows[0]["qty"] - 100) < 1e-6
+    assert abs(rows[0]["price"] - 120.0) < 1e-6
+    assert abs(rows[0]["qty"] * rows[0]["price"] - 12000) < 1e-6
+    # 分割後的賣:不動
+    assert abs(rows[1]["qty"] - 100) < 1e-6 and abs(rows[1]["price"] - 120.0) < 1e-6
+    # 調整後:1 個乾淨 round-trip、ret≈0(其實打平)、無假 orphan
+    rts, _ = tr.round_trips(rows)
+    assert len(rts) == 1 and abs(rts[0]["ret"]) < 1e-6
+    assert tr.orphan_sells(rows) == {}
+
+
+def test_driver_map_partial_tolerance():
+    """driver map 逐筆容錯:一筆格式壞不該丟掉整張 map。"""
+    import json, tempfile, os as _os
+    tr._DRIVER_MAP = dict(tr.DRIVER_FALLBACK)
+    bad = {"AAA": ["核電", 1], "BBB": "壞格式", "CCC": ["能源", 0]}   # BBB 缺 thematic
+    fd, p = tempfile.mkstemp(suffix=".json")
+    with _os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(bad, f)
+    ok = tr.load_driver_map(p)
+    _os.unlink(p)
+    assert ok == 2 and tr._DM_SKIPPED == 1                # 好的 2 筆收下、壞的 1 筆跳過
+    assert tr.driver("AAA") == ("核電", 1) and tr.driver("CCC") == ("能源", 0)
+    tr._DRIVER_MAP = dict(tr.DRIVER_FALLBACK)             # 還原,免污染其他測試
+
+
+def test_entry_style_chase_vs_dip():
+    """【風格】維雛形:追高 vs 抄底,用合成價格 fixture 驗(確定性、離線、不碰 yfinance)。
+
+    chase:單調上升、買在新高 → range_pct≈1 → lean=strength。
+    dip:先在 150~250 震盪建出區間、後段壓低,買在低檔 → range_pct 低 → lean=weakness。
+    """
+    import math, datetime as dt
+    try:
+        import pandas as pd
+    except ImportError:
+        return _SKIP                                      # 無 pandas → 跳過(這維本來就需要它)
+    idx = pd.bdate_range("2023-01-01", periods=300)
+
+    # ── chase:單調上升,後段每兩天買一筆(此時價格史已 >252)──
+    rising = pd.Series([100 + i * 0.3 for i in range(300)], index=idx)
+    px_up = pd.DataFrame({"AAA": rising})
+    buys_up = [dict(ticker="AAA", side="buy", qty=1, price=float(rising.iloc[i]),
+                    date=idx[i].date()) for i in range(260, 300, 2)]
+    d = tr.dim_entry_style(buys_up, px_up)
+    assert d["lean"] == "strength", f"追高應判 strength,實得 {d['lean']}（pct={d['median_pct']:.2f}）"
+    assert d["median_pct"] > 0.70
+
+    # ── dip:前段 150~250 震盪(撐出區間),後段壓在 165,買在低檔 ──
+    vals = [200 + 50 * math.sin(i / 10.0) if i < 252 else 165.0 for i in range(300)]
+    s = pd.Series(vals, index=idx)
+    px_dn = pd.DataFrame({"BBB": s})
+    buys_dn = [dict(ticker="BBB", side="buy", qty=1, price=165.0, date=idx[i].date())
+               for i in range(260, 300)]
+    d2 = tr.dim_entry_style(buys_dn, px_dn)
+    assert d2["lean"] == "weakness", f"抄底應判 weakness,實得 {d2['lean']}（pct={d2['median_pct']:.2f}）"
+    assert d2["median_pct"] < 0.30
+
+    # ── 樣本不足 → 低信賴、不 triggered(但 lean 仍可算)──
+    d3 = tr.dim_entry_style(buys_up[:3], px_up)
+    assert d3["low_conf"] and not d3["triggered"]
+
+    # ── 無價格 → 優雅降級,不 crash ──
+    d4 = tr.dim_entry_style(buys_up, None)
+    assert d4["lean"] is None and d4["low_conf"]
+
+
 # ─────────────────────── 選配:network smoke(β 方向)───────────────────────
 
 def test_beta_direction_network():

@@ -53,18 +53,29 @@ DRIVER_FALLBACK = {
     "IAU":("商品",0),"IEF":("債券",0),
 }
 _DRIVER_MAP = dict(DRIVER_FALLBACK)
+_DM_SKIPPED = 0                                    # 上次載入跳過的壞 entry 數(給 main 顯示)
 def driver(t): return _DRIVER_MAP.get(t, ("未分類", 0))
 def load_driver_map(path):
-    """載入 Claude 生成的 {ticker: [sector, thematic]} JSON 覆寫 fallback。讓冷門股也有正確 driver。"""
+    """載入 Claude 生成的 {ticker: [sector, thematic]} JSON 覆寫 fallback。讓冷門股也有正確 driver。
+    逐筆容錯:一筆格式壞只跳過那一筆、其餘照收(舊版整包 try → 一顆老鼠屎丟掉整張 map)。"""
     import json
+    global _DM_SKIPPED
+    _DM_SKIPPED = 0
     try:
         with open(path, encoding="utf-8") as f:
             m = json.load(f)
-        for t, v in m.items():
-            _DRIVER_MAP[t] = (v[0], int(v[1]))
-        return len(m)
-    except (OSError, ValueError, KeyError, IndexError, TypeError):
+    except (OSError, ValueError):
         return 0
+    if not isinstance(m, dict):
+        return 0
+    ok = 0
+    for t, v in m.items():
+        try:
+            _DRIVER_MAP[t] = (v[0], int(v[1]))
+            ok += 1
+        except (KeyError, IndexError, TypeError, ValueError):
+            _DM_SKIPPED += 1                       # 壞的跳過,不連累好的
+    return ok
 
 # ─────────────────────────── 1. 解析 ───────────────────────────
 def load(paths):
@@ -132,7 +143,7 @@ def positions(rows):
             if sh > 1e-9:
                 ac = cost / sh
                 pos[t][1] -= min(r["qty"], sh) * ac
-                pos[t][0] -= r["qty"]
+                pos[t][0] -= min(r["qty"], sh)   # clamp:賣量超過持有不讓股數變負(對帳單可能漏最早建倉)
     held = {t: (sh, c) for t, (sh, c) in pos.items() if sh > 1e-6}
     return held, avg_down
 
@@ -151,6 +162,21 @@ def current_cycles(rows):
             sh[t] = max(0.0, sh[t] - r["qty"])      # 截斷防跌負（oversell 賣超持倉）→ 否則後續 buy 被負數污染（雙審 blocker）
             if sh[t] <= 1e-6: start.pop(t, None)    # 清倉 → cycle 結束
     return {t: {"start": start[t], "seq": seq[t]} for t in start}
+
+def orphan_sells(rows):
+    """偵測『賣超』:某檔賣量超過已知買量。多半是對帳單沒涵蓋最早的建倉,
+    或先賣後買(做空)。只計數+列名,當報告最後的資料完整性提示,不進盈虧/洞的計算。
+    現階段範圍只處理『先買後賣』;先賣後買(做空)另開 issue 討論。"""
+    pos = defaultdict(float); orphan = defaultdict(float)
+    for r in rows:
+        t = r["ticker"]
+        if r["side"] == "buy":
+            pos[t] += r["qty"]
+        else:
+            if r["qty"] > pos[t] + 1e-9:
+                orphan[t] += r["qty"] - max(pos[t], 0.0)
+            pos[t] = max(pos[t] - r["qty"], 0.0)
+    return {t: q for t, q in orphan.items() if q > 1e-6}
 
 def classify_adds(rows, min_adds=3):
     """主從分類每個標的的加碼:疑似定投(漲跌都買/規律) vs 疑似凹單(只虧損買+金額加速) vs 待確認。
@@ -201,6 +227,42 @@ def fetch_prices(tickers, start):
     if data.ndim == 1:
         data = data.to_frame()
     return data, None
+
+def fetch_splits(tickers):
+    """抓每檔的分割事件 {ticker: [(date, ratio), ...]}。抓不到/離線 → 回 {}(不調整,降級)。"""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+    out = {}
+    for t in sorted(set(tickers)):
+        try:
+            s = yf.Ticker(t).splits           # pandas Series:index=日期, value=分割比率(10:1 → 10.0)
+            if s is not None and len(s):
+                out[t] = [(d.date(), float(r)) for d, r in s.items() if r and r > 0]
+        except Exception:                     # 單檔抓不到不影響其他檔
+            continue
+    return {t: v for t, v in out.items() if v}
+
+def adjust_for_splits(rows, splits):
+    """把每筆成交換算到『分割後(今日)』基礎,與 yfinance auto_adjust 的價格對齊。
+    因子 = 成交日『之後』發生的所有分割比率連乘;股數×因子、價格÷因子 → 成交金額不變。
+    這同時修好三件事:① 跨分割 round-trip 的 ret/fwd ② 持倉市值(股數×今日價) ③ 分割造成的假 orphan。
+    splits={} (離線/抓不到) → 原地不動,沿用名目價(現狀行為)。回傳實際調整的成交筆數。"""
+    n = 0
+    for r in rows:
+        evs = splits.get(r["ticker"])
+        if not evs:
+            continue
+        factor = 1.0
+        for d, ratio in evs:
+            if d > r["date"]:                 # 只有成交日之後的分割才影響這筆
+                factor *= ratio
+        if abs(factor - 1.0) > 1e-9:
+            r["qty"] = r["qty"] * factor
+            r["price"] = r["price"] / factor
+            n += 1
+    return n
 
 def adaptive_n_fwd(rows):
     """賣出後觀察窗隨資料長度自適應:資料短就用短窗,讓半年資料的近端賣出也算得到 winner_early。"""
@@ -371,7 +433,7 @@ def print_alpha_beta(d):
 # ─────────────────────────── 5. 五維 metrics ───────────────────────────
 MIN_WINNERS = 5     # winner_early 至少要這麼多「賣掉的贏家」才算可信(半年資料通常達得到)
 
-def dim_exit(rts, fwds):
+def dim_exit(rts, fwds, n_fwd=N_FWD):
     # rts 已在 main 預先濾成「決策賣出」（排除大盤/債/商品 ETF 再平衡）
     early_rate = avg_forgone = winner_early = None
     n_winners = 0
@@ -398,7 +460,7 @@ def dim_exit(rts, fwds):
     return dict(dim="出場紀律", tier=1, triggered=trig, severity=min(max(sev,0),1),
                 early_rate=early_rate, avg_forgone=avg_forgone, winner_early=winner_early,
                 disp_gap=disp, hold_win=hw, hold_lose=hl, sell_win_rate=win_rate,
-                n_rt=len(rts), n_scored=len(scored), n_trunc=n_trunc,
+                n_rt=len(rts), n_scored=len(scored), n_trunc=n_trunc, n_fwd=n_fwd,
                 n_winners=n_winners, low_conf=low_conf)
 
 def dim_size(rows, held, last_px):
@@ -479,6 +541,51 @@ def dim_avgdown(avg_down, held, last_px, size_dim):
     tickers = sorted({e["ticker"] for e in avg_down})
     return dict(dim="加碼攤平", tier=1, triggered=(breach >= 1),
                 severity=sev, count=cnt, breach=breach, tickers=tickers)
+
+# ── 【風格】維雛形(v2a,解鎖 v2c 誠實閥)──────────────────────────────────────
+# 與普世維不同:這維不是「洞」,是『風格軸』——各派對它給相反 stance(動能派稱讚追高、
+# 價值派斥責追高)。研究依據與設計見 docs/style-detection-research.md。先不接 lens/閥,
+# 只算訊號 + 印讀數,驗算得準不準。
+MIN_ENTRY_BUYS = 15        # 研究:n≳15 才分得開 0.65(動能) vs 0.50(中性);不足 → 低信賴
+ENTRY_LOOKBACK = 252       # 52 週 = 一年交易日(George-Hwang 錨)
+
+def dim_entry_style(rows, data, lookback=ENTRY_LOOKBACK):
+    """進場相對位置(追高 vs 抄底):每筆 BUY 在過去一年價格區間的位置。
+    range_pct≈1 = 買在區間頂(追高/動能, lean=strength);≈0 = 買在區間底(抄底/逆勢, lean=weakness)。
+    紀律:① point-in-time(只用進場前的價,防 look-ahead)② 只報方向不報精確值(漂移容錯)
+    ③ 樣本不足回低信賴 ④ 對事不對人——這是風格不是洞。
+    依賴 adjust_for_splits 已把成交價對齊今日基礎,否則跨分割的區間會錯 10 倍。"""
+    if data is None:
+        return dict(dim="進場", axis="style", tier=2, triggered=False, severity=0,
+                    lean=None, n=0, low_conf=True, note="無價格(需 yfinance)")
+    import pandas as pd
+    cols = set(getattr(data, "columns", []))
+    pcts, forms = [], []
+    for r in rows:
+        if r["side"] != "buy" or r["ticker"] not in cols:
+            continue
+        col = data[r["ticker"]].dropna()
+        prior = col[col.index < pd.Timestamp(r["date"])].tail(lookback)   # 只用進場前的價
+        if len(prior) < 30:                                               # 歷史太短不定位
+            continue
+        lo, hi = float(prior.min()), float(prior.max())
+        if hi - lo < 1e-9:
+            continue
+        pcts.append(min(max((r["price"] - lo) / (hi - lo), 0.0), 1.0))
+        forms.append(r["price"] / float(prior.iloc[0]) - 1)               # 形成期報酬(窗起→進場)
+    n = len(pcts)
+    if n == 0:
+        return dict(dim="進場", axis="style", tier=2, triggered=False, severity=0,
+                    lean=None, n=0, low_conf=True, note="無可定位的買入")
+    med = statistics.median(pcts)
+    low_conf = n < MIN_ENTRY_BUYS
+    lean = "strength" if med > 0.70 else "weakness" if med < 0.30 else None
+    sev = min(max(abs(med - 0.5) * 2, 0), 1)
+    if low_conf:
+        sev *= 0.7
+    return dict(dim="進場", axis="style", tier=2, triggered=(lean is not None and not low_conf),
+                severity=sev, lean=lean, median_pct=med,
+                median_form=statistics.median(forms), n=n, low_conf=low_conf)
 
 # ─────────────────────────── 6. 卡片選擇 + 渲染 ───────────────────────────
 # ── 鏡片層(可換大師):洞的「規矩 + 引言」來自 lens 檔,engine 不 hardcode VY ──
@@ -732,6 +839,7 @@ def ticker_diagnosis(rts, adds_class, held, last_px, top_n=7):
     """標的層診斷(對事不對人):每檔金額影響(已實現+未實現)+ 行為標籤,按 |金額| 排序只取 top。
     加碼用主從分類器(classify_adds)分疑似定投/凹單/待確認,不再用純結果判(避 outcome bias);
     出場叫『賣後機會成本』不叫『賣太早』(去事後諸葛審判語氣)。"""
+    last_px = last_px or {}                # 無 yfinance/下載失敗 → last_px=None,降級成只用已實現,不 crash
     agg = defaultdict(lambda: dict(realized=0.0, unreal=0.0, win_n=0, win_early=0,
                                    cur_ret=None, mval=0.0))
     for r in rts:
@@ -791,7 +899,7 @@ def number_line(d):
         s = []
         if d["early_rate"] is not None:
             we = f"；賣掉賺錢的有 {d['winner_early']*100:.0f}% 續漲（賣太早）" if d.get("winner_early") is not None else ""
-            s.append(f"{d['n_rt']} 筆決策賣出（{d['n_scored']} 有 fwd、{d['n_trunc']} 截斷）中 {d['early_rate']*100:.0f}% 在 {N_FWD} 天後更高、平均續漲 {d['avg_forgone']*100:+.1f}%{we}")
+            s.append(f"{d['n_rt']} 筆決策賣出（{d['n_scored']} 有 fwd、{d['n_trunc']} 截斷）中 {d['early_rate']*100:.0f}% 在 {d.get('n_fwd', N_FWD)} 天後更高、平均續漲 {d['avg_forgone']*100:+.1f}%{we}")
         s.append(f"賺錢抱 {d['hold_win']:.0f} 天 / 賠錢抱 {d['hold_lose']:.0f} 天（處置缺口 {d['disp_gap']:+.0f}）")
         return "；".join(s)
     if n == "部位 sizing":
@@ -1162,19 +1270,21 @@ def main():
     master = load_lens()                                  # 顯示用哲學名(去名,可換大師/哲學檔)
     dm = os.environ.get("TR_DRIVER_MAP")                  # Claude 生成的 driver map(冷門股分類)
     n_dm = load_driver_map(dm) if dm else 0
+    n_adj = adjust_for_splits(rows, fetch_splits({r["ticker"] for r in rows}))  # 分割調整,對齊今日價
     rts, open_lots = round_trips(rows)
     held, avg_down = positions(rows)
     tickers = {r["ticker"] for r in rts} | set(held.keys())
     start = (min((r["entry"] for r in rts), default=rows[0]["date"]) - dt.timedelta(days=10)).isoformat()
     px, yf_err = fetch_prices(tickers, start)
-    fwds, last_px = fwd_from_px(rts, px, adaptive_n_fwd(rows))   # 觀察窗隨資料長度自適應
+    n_fwd = adaptive_n_fwd(rows)                           # 觀察窗隨資料長度自適應
+    fwds, last_px = fwd_from_px(rts, px, n_fwd)
     last_px = last_px or {}                                # 離線/無價格 → {} 而非 None,讓下游(ticker_diagnosis 等)不 crash
     # is_demo:任一輸入 path 含 'mock' → 是 demo,卡頭/JSON 都標(SKILL Step 3 + issue #21:mock alpha 失真,要當下標警告)
     is_demo = any("mock" in p.replace(os.sep, "/").lower() for p in paths)
     BROAD = {"大盤ETF", "商品", "債券", "區域ETF"}   # 再平衡/現金管理，非選股決策
     decision_rts = [r for r in rts if driver(r["ticker"])[0] not in BROAD]
     d_size = dim_size(rows, held, last_px)
-    d_exit = dim_exit(decision_rts, fwds); d_div = dim_diversify(held, last_px)
+    d_exit = dim_exit(decision_rts, fwds, n_fwd); d_div = dim_diversify(held, last_px)
     d_hold = dim_hold(rts); d_avgdown = dim_avgdown(avg_down, held, last_px, d_size)
     dims = [d_exit, d_size, d_div, d_hold, d_avgdown]
     strength = dim_strength(d_exit, d_size, d_avgdown, d_div, d_hold, decision_rts)  # 先給做對的(附案例)
@@ -1189,12 +1299,14 @@ def main():
     adds_class = classify_adds(rows)                       # 主從分類:疑似定投 vs 凹單 vs 待確認
     tdiag = ticker_diagnosis(rts, adds_class, held, last_px)  # 標的層:按金額排序,對事不對人
 
+    dm_skip = f"({_DM_SKIPPED} 筆格式錯跳過)" if _DM_SKIPPED else ""
+    split_note = f"｜分割調整: {n_adj} 筆" if n_adj else ""
     # JSON 模式(SKILL Step 3 走這條):stdout 純 JSON 給 Claude 寫敘事卡;meta 走 stderr 不污染
     if os.environ.get("TR_JSON"):
         import json
         meta = (f"# 載入 {len(rows)} 筆交易（{rows[0]['date']} ~ {rows[-1]['date']}），"
                 f"{len(rts)} round-trip,持倉 {len(held)}｜yfinance: {'OK' if not yf_err else yf_err}"
-                f"｜鏡片: {master or 'fallback'}｜driver map: {n_dm} 檔"
+                f"｜鏡片: {master or 'fallback'}｜driver map: {n_dm} 檔{dm_skip}{split_note}"
                 + (" (純 fallback,冷門股可能失準)" if not n_dm else "")
                 + ("｜⚠️ DEMO 模式" if is_demo else ""))
         print(meta, file=sys.stderr)
@@ -1210,12 +1322,41 @@ def main():
         print(f"# 載入 {len(rows)} 筆交易（{rows[0]['date']} ~ {rows[-1]['date']}），"
               f"{len(rts)} 個 round-trip，當前持倉 {len(held)} 檔。", end="")
         print(f" yfinance: {'OK' if not yf_err else yf_err}｜鏡片: {master or 'fallback'}"
-              f"｜driver map: {n_dm} 檔" + (" (純 fallback,冷門股可能失準)" if not n_dm else ""))
+              f"｜driver map: {n_dm} 檔{dm_skip}{split_note}" + (" (純 fallback,冷門股可能失準)" if not n_dm else ""))
         print(f"# 出場紀律只看「決策賣出」：{len(decision_rts)}/{len(rts)} round-trip"
               f"（排除 {len(rts)-len(decision_rts)} 筆大盤/債/商品 ETF 再平衡）")
         render(dims, strength, overview, best, worst, wi, trend, rx, tdiag)
         print_alpha_beta(ab)
         print_payoff_attr(pa)                             # 盈虧比拆解(誰在撐/拖,反事實)
+        d_entry = dim_entry_style(rows, px)               # 【風格】維雛形(不進洞排序,先驗訊號)
+        print("\n" + "─"*60)
+        print("  〔風格雛形 · 進場相對位置(對事不對人,只報方向;閥未接)〕")
+        if d_entry.get("note"):
+            print(f"    {d_entry['note']}——這維要 yfinance 日線才算得出")
+        else:
+            zh = {"strength": "偏追高/順勢——買在區間高位(動能派視為策略、價值派視為追高)",
+                  "weakness": "偏抄底/逆勢——買在區間低位(價值派視為紀律、動能派視為接刀)",
+                  None: "無明顯方向(中性)"}
+            conf = "樣本足" if not d_entry["low_conf"] else f"低信賴:可定位買入僅 {d_entry['n']} 筆(<{MIN_ENTRY_BUYS})"
+            print(f"    {zh[d_entry['lean']]}")
+            print(f"    進場區間位置中位 {d_entry['median_pct']*100:.0f}%（{d_entry['n']} 筆 · {conf}）"
+                  f" lean={d_entry['lean'] or '—'}")
+        notes = []                                        # 資料完整性提示統一收在最後,不干擾上面的洞
+        orphans = orphan_sells(rows)
+        if orphans:
+            names = ", ".join(f"{t}({q:.0f} 股)" for t, q in sorted(orphans.items()))
+            notes.append(f"{len(orphans)} 檔『賣超』(賣量 > 已知買量):{names}"
+                         f"——多半是對帳單沒涵蓋最早建倉,已從盈虧忽略(做空支援另議)")
+        unclassified = sorted(t for t in held if driver(t)[0] == "未分類")
+        if unclassified:
+            more = f" 等 {len(unclassified)} 檔" if len(unclassified) > 8 else ""
+            notes.append(f"{', '.join(unclassified[:8])}{more} 未分類 driver——分散維可能偏樂觀,"
+                         f"可補 driver map(見 SKILL Step 0.5)讓假分散抓得準")
+        if notes:
+            print("\n" + "─"*60)
+            print("  ⓘ 資料完整性(不影響上面的洞,只是提醒數字有多硬):")
+            for nt in notes:
+                print(f"    · {nt}")
     if os.environ.get("TR_STATE_OUT"):                    # 設了才寫薄 state;不設 → 卡片 stdout 零變
         import json, tempfile
         path = os.environ["TR_STATE_OUT"]

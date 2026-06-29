@@ -22,10 +22,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      # state-loop 測試經 subprocess 跑完整 main(),而 main 硬依賴 pandas(fwd_from_px)。
-      # 但刻意【不】裝 yfinance —— 讓 fetch_prices() 走「未安裝→不連網」降級,
-      # CI 維持離線、確定性(不抓即時股價、不 flaky),也順便驗證了引擎的優雅降級。
-      - name: Install pandas only (offline by design — no yfinance)
-        run: python3 -m pip install pandas
+      # 引擎執行期需要 pandas(dim_alpha_beta)與 rich(卡片渲染)——state-loop 測試經
+      # subprocess 跑完整 main()→render()。但刻意【不】裝 yfinance,讓 fetch_prices() 走
+      # 「未安裝→不連網」降級 → CI 維持離線、確定性(不抓即時股價、不 flaky),順便驗證優雅降級。
+      - name: Install runtime deps (offline by design — no yfinance)
+        run: python3 -m pip install pandas rich
       - name: Run full test suite (offline, deterministic)
         run: python3 tests/run_all.py
