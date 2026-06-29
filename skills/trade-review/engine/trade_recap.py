@@ -9,16 +9,24 @@ trade-review · trade-recap engine v0.2
 """
 import csv, os, sys, statistics, datetime as dt
 from collections import defaultdict, deque
-from rich.console import Console, Group
-from rich.panel import Panel
-from rich.text import Text
-from rich.rule import Rule
-from rich.table import Table
-from rich.padding import Padding
+try:
+    from rich.console import Console, Group
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.rule import Rule
+    from rich.table import Table
+    from rich.padding import Padding
+    _HAS_RICH = True
+except ImportError:                  # 引擎核心(純函式 / TR_JSON 路徑)不需 rich;缺 rich 時仍可 import,別硬依賴(對齊 #26)
+    _HAS_RICH = False
 
 # 卡片固定寬度（含邊框），與 ccstory 對齊；中英混排靠 Rich East Asian Width
 CARD_WIDTH = 84
-_console = Console(width=CARD_WIDTH, highlight=False)
+_console = Console(width=CARD_WIDTH, highlight=False) if _HAS_RICH else None
+
+def _no_rich_notice(what="復盤卡"):
+    """缺 rich 時的優雅降級:純函式 / TR_JSON 不受影響,只有人話卡需要 rich 渲染。"""
+    print(f"（{what}需要 rich 才能渲染:pip install rich;或用 TR_JSON=1 取得免 rich 的完整結構化輸出）")
 
 DEFAULT_CSV = os.path.join(os.path.dirname(__file__), "..", "mock", "mock_trades.csv")
 
@@ -368,6 +376,8 @@ def alpha_credible(ab, dims):
 
 def print_alpha_beta(d):
     """獨立 Panel:把報酬拆成「運氣(大盤+賽道)」vs「技巧(選股)」。"""
+    if not _HAS_RICH:
+        return
     if d.get("note"):
         _console.print()
         _console.print(Panel(
@@ -704,6 +714,8 @@ def payoff_attribution(rts, top_n=4):
 
 def print_payoff_attr(pa):
     """獨立 Panel:已實現交易的貢獻度,誰在撐 vs 誰在拖,加反事實。"""
+    if not _HAS_RICH:
+        return
     if not pa:
         return
     fmt = lambda v: "∞" if v is None else f"{v:.1f}"
@@ -931,6 +943,8 @@ def _pct(v, unit="%", bold=False):
 def render(dims, strength=None, overview=None, best=None, worst=None, wi=None, trend=None, rx=None, tdiag=None):
     """把復盤卡渲染成一張 Rich Panel（cyan 邊框，ANSI color，中英對齊）。
     架構：一張外框大 Panel，內部按段用 Rule(───) 分節；五維行為診斷用 bar chart 取代內部加權公式。"""
+    if not _HAS_RICH:
+        _no_rich_notice(); return
     TW = {1: 1.0, 2: 0.7}
     trig = [d for d in dims if d["triggered"]]
     trig.sort(key=lambda d: d["severity"] * TW[d["tier"]], reverse=True)
@@ -1081,23 +1095,11 @@ def render(dims, strength=None, overview=None, best=None, worst=None, wi=None, t
             rx_tbl.add_row(Text("▸", style="bold"), cell)
         parts.append(Padding(rx_tbl, (0, 1)))
         actionable = [r for r in rx if r.get("rule")]
-        if actionable:
-            n = min(len(actionable), 3)
-            if n == 1:                                  # 只 1 條 → 單行(避免「從這 1 條候選挑」語意怪)
-                star_hdr = Text("\n★ 下次只改這一件 ", style="bold yellow")
-                star_hdr.append("(可立即執行 + 可驗)", style="dim yellow")
-                parts.append(Padding(star_hdr, (0, 1)))
-                parts.append(Padding(Text(actionable[0]['rule'], style="bold"), (0, 3)))
-            else:                                       # 2-3 條候選讓用戶挑/改一條(SKILL L182「給 2-3 條候選讓他挑」)
-                star_hdr = Text("\n★ 下次只改這一件 ", style="bold yellow")
-                star_hdr.append(f"(從這 {n} 條候選挑/改一條)", style="dim yellow")
-                parts.append(Padding(star_hdr, (0, 1)))
-                cand_tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False, expand=False)
-                cand_tbl.add_column(width=2, no_wrap=True)
-                cand_tbl.add_column(overflow="fold")
-                for i, r in enumerate(actionable[:3], 1):
-                    cand_tbl.add_row(Text(f"{i}.", style="bold yellow"), Text(r['rule'], style="bold"))
-                parts.append(Padding(cand_tbl, (0, 3)))
+        if actionable:                                  # 引擎目前最多給一條處方規矩(讓 prescribe 產 2-3 候選的改法見 issue)
+            star_hdr = Text("\n★ 下次只改這一件 ", style="bold yellow")
+            star_hdr.append("(可立即執行 + 可驗)", style="dim yellow")
+            parts.append(Padding(star_hdr, (0, 1)))
+            parts.append(Padding(Text(actionable[0]['rule'], style="bold"), (0, 3)))
 
     _console.print()
     _console.print(Panel(
@@ -1215,7 +1217,7 @@ def build_card_data(dims, strength, overview, best, worst, wi, rx, tdiag,
     對應 issue #20 七條規格鐵律破洞 — 把渲染責任從 engine 移到 Claude:
     - thesis_questions 包出來但標明只在 Step 2 對話用(SKILL L77-79「確認在出卡之前」)
     - top_holes 帶 lens_quote 但別當結語用(SKILL L192)
-    - candidate_rules 給 2-3 條候選,不只第一條(SKILL L182)
+    - candidate_rules:引擎目前最多給一條處方規矩;Step 3 有幾條就用幾條(讓 prescribe 產 2-3 候選的改法見 issue)
     - dims_raw 5 維給結構化資料,讓 Claude「一句人話帶過其餘維」(SKILL L158-159)
     - is_demo 標明 → mock 卡頭應加 [demo · 非真實成績]
     """
@@ -1237,7 +1239,7 @@ def build_card_data(dims, strength, overview, best, worst, wi, rx, tdiag,
             "raw": d,
         })
 
-    # 候選規矩:Step 3 對話跟用戶挑 1-3 條(SKILL L182「給 2-3 條候選讓他挑」)
+    # 候選規矩:引擎目前最多給一條(prescribe 結構所限);[:3] 保留以備未來多候選(見 issue)
     candidate_rules = [r for r in (rx or []) if r.get("rule")][:3]
 
     # ⚠️ thesis_questions 給 Step 2 對話用,絕不准印在卡上(SKILL L77-79「確認在出卡之前」)
@@ -1256,7 +1258,7 @@ def build_card_data(dims, strength, overview, best, worst, wi, rx, tdiag,
         "ticker_diagnosis": tdiag,                          # tags 已是人話
         "thesis_questions": thesis_questions,               # ⚠️ Step 2 對話用,不准印卡上
         "top_holes": top_holes,                             # top 1-2,Claude 寫敘事用
-        "candidate_rules": candidate_rules,                 # 2-3 條,讓用戶挑
+        "candidate_rules": candidate_rules,                 # 目前多半一條,讓用戶確認/改(未來多條再讓他挑)
         "prescriptions": rx,                                # 完整處方層
         "alpha_beta_breakdown": ab,
         "payoff_attribution": pa,
