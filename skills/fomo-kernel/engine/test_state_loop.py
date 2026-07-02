@@ -122,6 +122,26 @@ def test_insufficient_span_gate():
     print("✅ #21.4 insufficient span gate（<60 交易日擋假承諾 / 長跨度不誤殺）全過\n")
 
 
+def test_classify_adds_fixes():
+    """#41 G:① 首筆建倉不算加碼(loss_ratio 不被稀釋、n_adds 不 overcount)
+    ② oversell 不讓股數變負污染後續加碼偵測(clamp 對齊 positions)。"""
+    from trade_recap import classify_adds
+    def _B(t, q, px, d): return {"ticker": t, "side": "buy", "qty": q, "price": px, "date": dt.date.fromisoformat(d)}
+    def _S(t, q, px, d): return {"ticker": t, "side": "sell", "qty": q, "price": px, "date": dt.date.fromisoformat(d)}
+    # G1:1 筆初始建倉(高價)+ 3 筆虧損加碼 → loss_ratio 應 3/3=1.0、n_adds=3(舊碼含首筆 = 3/4=0.75、n=4)
+    g1 = classify_adds([_B("AAA", 100, 100, "2024-01-01"), _B("AAA", 100, 90, "2024-02-01"),
+                        _B("AAA", 100, 80, "2024-03-01"), _B("AAA", 100, 70, "2024-04-01")])
+    assert g1["AAA"]["n_adds"] == 3, f"首筆不該算加碼,期望 n_adds=3,實得 {g1['AAA']['n_adds']}"
+    assert abs(g1["AAA"]["loss_ratio"] - 1.0) < 1e-9, \
+        f"3 筆加碼全虧 → loss_ratio 應=1.0(舊碼含首筆會被稀釋成 0.75),實得 {g1['AAA']['loss_ratio']}"
+    # G2:oversell(持 100 賣 200)後再進場、再虧損加碼 → 不因股數變負而漏掉那筆加碼
+    g2 = classify_adds([_B("BBB", 100, 100, "2024-01-01"), _S("BBB", 200, 110, "2024-01-15"),
+                        _B("BBB", 100, 80, "2024-02-01"), _B("BBB", 100, 70, "2024-03-01")])
+    assert g2["BBB"]["loss_ratio"] > 0.0, \
+        f"oversell 後的虧損加碼應被偵測(舊碼股數變負會漏 → loss_ratio=0.0),實得 {g2['BBB']['loss_ratio']}"
+    print("✅ #41 G classify_adds（首筆不算加碼 / oversell 不污染後續偵測）全過\n")
+
+
 def main():
     src = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CSV
     cutoff = sys.argv[2] if len(sys.argv) > 2 else "2024-07-01"
@@ -139,6 +159,7 @@ def main():
     print("✅ current_cycles 邊界（oversell / 清倉重建 / 缺期初）全過\n")
 
     test_insufficient_span_gate()                              # #21.4:60 交易日 gate
+    test_classify_adds_fixes()                                 # #41 G:首筆/oversell
 
     tmp = tempfile.mkdtemp(prefix="tr_state_test_")
     seg1, seg2 = os.path.join(tmp, "seg1.csv"), os.path.join(tmp, "seg2.csv")

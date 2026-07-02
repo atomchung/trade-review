@@ -199,21 +199,24 @@ def classify_adds(rows, min_adds=3):
     for r in rows:
         t = r["ticker"]; sh, cost = pos[t]
         if r["side"] == "buy":
-            avg = cost / sh if sh > 1e-9 else r["price"]
-            buys[t].append((r["date"], r["qty"] * r["price"], sh > 1e-9 and r["price"] < avg))
+            is_add = sh > 1e-9                          # 已有倉才算「加碼」;首筆建倉 / 清倉後重建不算(#41 G1)
+            avg = cost / sh if is_add else r["price"]
+            buys[t].append((r["date"], r["qty"] * r["price"], is_add and r["price"] < avg, is_add))
             pos[t][0] += r["qty"]; pos[t][1] += r["qty"] * r["price"]
         elif sh > 1e-9:
-            pos[t][1] -= min(r["qty"], sh) * (cost / sh); pos[t][0] -= r["qty"]
+            pos[t][1] -= min(r["qty"], sh) * (cost / sh); pos[t][0] -= min(r["qty"], sh)   # #41 G2:clamp 股數不跌負(對齊 positions)
     out = {}
     for t, bs in buys.items():
-        if len(bs) < min_adds: continue
-        n = len(bs)
-        loss_ratio = sum(1 for _, _, il in bs if il) / n            # 主訊號:只在虧損買的比例(價格無關性)
-        loss_amts = [amt for _, amt, il in bs if il]
+        if len(bs) < min_adds: continue                             # gate:總買入筆數(維持既有觸發門檻)
+        adds = [b for b in bs if b[3]]                              # 只看「加碼」(sh>0 的買),排除首筆建倉 → loss_ratio 不被稀釋(#41 G1)
+        if not adds: continue                                       # 每筆都是初始建倉、無真正加碼 → 不分類
+        n = len(adds)
+        loss_ratio = sum(1 for _, _, il, _ in adds if il) / n       # 主訊號:加碼中虧損買的比例(價格無關性)
+        loss_amts = [amt for _, amt, il, _ in adds if il]
         accel = len(loss_amts) >= 3 and statistics.mean(loss_amts[-2:]) > statistics.mean(loss_amts[:2]) * 1.5
-        gaps = [(bs[i + 1][0] - bs[i][0]).days for i in range(n - 1)]
+        gaps = [(adds[i + 1][0] - adds[i][0]).days for i in range(n - 1)]
         mg = statistics.mean(gaps) if gaps else 0
-        regular = bool(gaps) and mg > 0 and statistics.pstdev(gaps) < mg * 0.6   # 輔:時間規律(間隔 CV 低)
+        regular = bool(gaps) and mg > 0 and statistics.pstdev(gaps) < mg * 0.6   # 輔:加碼時間規律(間隔 CV 低)
         if loss_ratio < 0.6 or regular:                             # 漲跌都買 或 時間規律 → 定投
             cls = "疑似定投"
         elif loss_ratio > 0.8 and accel:                            # 只虧損買 + 金額加速 → 凹單
