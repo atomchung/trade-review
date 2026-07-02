@@ -190,7 +190,7 @@ def orphan_sells(rows):
             pos[t] = max(pos[t] - r["qty"], 0.0)
     return {t: q for t, q in orphan.items() if q > 1e-6}
 
-def classify_adds(rows, min_adds=3):
+def classify_adds(rows, min_adds=2):   # min_adds 指「加碼」筆數(排除首筆);原「≥3 買入」≈「≥2 加碼」,改口徑後對齊(#41 review)
     """主從分類每個標的的加碼:疑似定投(漲跌都買/規律) vs 疑似凹單(只虧損買+金額加速) vs 待確認。
     codex+gemini review 定稿:主從不投票;『價格無關 + 時間規律』為主、金額一致性最易誤判只當輔助;
     機械只下『疑似』,最終靠用戶確認 thesis / 標交易意圖(進場打標 = v2 更根本解)。"""
@@ -199,21 +199,23 @@ def classify_adds(rows, min_adds=3):
     for r in rows:
         t = r["ticker"]; sh, cost = pos[t]
         if r["side"] == "buy":
-            avg = cost / sh if sh > 1e-9 else r["price"]
-            buys[t].append((r["date"], r["qty"] * r["price"], sh > 1e-9 and r["price"] < avg))
+            is_add = sh > 1e-9                          # 已有倉才算「加碼」;首筆建倉 / 清倉後重建不算(#41 G1)
+            avg = cost / sh if is_add else r["price"]
+            buys[t].append((r["date"], r["qty"] * r["price"], is_add and r["price"] < avg, is_add))
             pos[t][0] += r["qty"]; pos[t][1] += r["qty"] * r["price"]
         elif sh > 1e-9:
-            pos[t][1] -= min(r["qty"], sh) * (cost / sh); pos[t][0] -= r["qty"]
+            pos[t][1] -= min(r["qty"], sh) * (cost / sh); pos[t][0] -= min(r["qty"], sh)   # #41 G2:clamp 股數不跌負(對齊 positions)
     out = {}
     for t, bs in buys.items():
-        if len(bs) < min_adds: continue
-        n = len(bs)
-        loss_ratio = sum(1 for _, _, il in bs if il) / n            # 主訊號:只在虧損買的比例(價格無關性)
-        loss_amts = [amt for _, amt, il in bs if il]
+        adds = [b for b in bs if b[3]]                              # 只看「加碼」(sh>0 的買),排除首筆建倉/清倉後重建(#41 G1)
+        if len(adds) < min_adds: continue                           # gate 用加碼數,與分類同口徑;擋掉 0/1 筆加碼的無意義分類(#41 review 共識)
+        n = len(adds)
+        loss_ratio = sum(1 for _, _, il, _ in adds if il) / n       # 主訊號:加碼中虧損買的比例(價格無關性)
+        loss_amts = [amt for _, amt, il, _ in adds if il]
         accel = len(loss_amts) >= 3 and statistics.mean(loss_amts[-2:]) > statistics.mean(loss_amts[:2]) * 1.5
-        gaps = [(bs[i + 1][0] - bs[i][0]).days for i in range(n - 1)]
+        gaps = [(adds[i + 1][0] - adds[i][0]).days for i in range(n - 1)]
         mg = statistics.mean(gaps) if gaps else 0
-        regular = bool(gaps) and mg > 0 and statistics.pstdev(gaps) < mg * 0.6   # 輔:時間規律(間隔 CV 低)
+        regular = len(gaps) >= 2 and mg > 0 and statistics.pstdev(gaps) < mg * 0.6   # 輔:加碼時間規律(間隔 CV 低);需≥2 間隔(≥3 加碼)—— 單一 gap 的 pstdev 恆=0 會誤判規律(#41 review)
         if loss_ratio < 0.6 or regular:                             # 漲跌都買 或 時間規律 → 定投
             cls = "疑似定投"
         elif loss_ratio > 0.8 and accel:                            # 只虧損買 + 金額加速 → 凹單
